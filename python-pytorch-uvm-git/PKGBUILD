@@ -115,8 +115,8 @@ build() {
   export USE_CUDA=ON
   export USE_CUDNN=ON
   export USE_NCCL=ON
-  export CXXFLAGS="-Wno-dev -Wno-changes-meaning -fpermissive $CXXFLAGS"
-  export CFLAGS="-Wno-dev -Wno-changes-meaning -fpermissive $CFLAGS"
+  export CXXFLAGS="-Wfatal-errors -w -fpermissive $CXXFLAGS"
+  export CFLAGS="-Wfatal-errors -w -fpermissive $CFLAGS"
   cd "${srcdir}/${_pkgname}-uvm"
   python setup.py build
 }
