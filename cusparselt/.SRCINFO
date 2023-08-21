@@ -1,0 +1,20 @@
+pkgbase = cusparselt
+	pkgdesc = NVIDIA's GPU programming toolkit
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://developer.nvidia.com/cuda-zone
+	install = cusparselt.install
+	arch = x86_64
+	license = custom:NVIDIA
+	depends = gcc12
+	depends = opencl-nvidia
+	depends = nvidia-utils
+	depends = cuda>=11.4
+	options = !strip
+	options = staticlibs
+	source = https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-x86_64/libcusparse_lt-linux-x86_64-0.4.0.7-archive.tar.xz
+	source = cusparselt.pc
+	sha256sums = 15fc65cddcc76dceec41985a0737bc055c3944eadd02589ec8883f1196911f78
+	sha256sums = d0cebccfcfb37133173ebfe14e40e86f21da94ed7caa01e6167f9ff033ac0175
+
+pkgname = cusparselt
