@@ -2,7 +2,7 @@
 pkgname='python-pytorch-uvm-git'
 _pkgname='pytorch'
 _pkgver=2.0.1
-pkgver=2.0.1.r62954.fd214aa8be
+pkgver=2.0.1
 pkgrel=1
 pkgdesc='Tensors and Dynamic neural networks in Python with strong GPU acceleration'
 arch=('x86_64')
@@ -11,6 +11,7 @@ license=('BSD')
 depends=(
   'ffmpeg'
   'gflags'
+  'gcc12'
   'google-glog'
   'leveldb'
   'lmdb'
@@ -21,12 +22,18 @@ depends=(
   'python-future'
   'python-numpy'
   'python-yaml'
-  'qt5-base'
+  'qt6-base'
   'zeromq'
   'cuda'
   'nccl'
   'magma-cuda'
   'cudnn'
+  'python-typing_extensions'
+  'numactl'
+  'python-jinja'
+  'python-networkx'
+  'python-filelock'
+  'python-sympy'
 )
 makedepends=(
   'cmake'
@@ -34,12 +41,18 @@ makedepends=(
   'git'
   'python-setuptools'
 )
-source=("${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm")
-sha512sums=('SKIP')
-
-get_pyver() {
-  python -c 'import sys; print(str(sys.version_info[0]) + "." + str(sys.version_info[1]))'
-}
+source=(
+  "${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm"
+  fix-building-for-torchvision.patch
+  fix_include_system.patch
+  protobuf-23.patch
+  use-system-libuv.patch
+)
+sha512sums=('SKIP'
+            'e58c4991723b1aa57eb6ccabadccc85263484adbb2327014396b41aa228cf38c7344e3c3eb132dd374791699bdd3a06412e1da6cab802d28fb9992fc7e68fb14'
+            'e0160e35c6e196bdfb85267ef7d8b3d81f332ca869cefb4c12541d4f891474b05b569545e7913c9d8628ce561c6adea121132826e380db3ff2a7a62676d3be46'
+            'b37d32d3bc005a68e5ebb40c42396214d75595f00e59c59719fc7fe1eabcff436f34520fb66aa671aa72ac5c5b534bc77dc6558c726a9c7978a39a9b569ca270'
+            'ad2046b1870975054b8ddcb773197abcf0de9d5a4245cf87a0cb2965e080a7182b82044c7f242e2ef342bf8c6a796efd05c5161c380f18330c4e13404a4efa87')
 
 prepare() {
   cd "${_pkgname}-uvm"
@@ -51,6 +64,25 @@ prepare() {
   # It will result in the same package, don't worry.
   git submodule sync
   git submodule update --init --recursive
+
+  # Fix cmake prefix path (FS#78665)
+  sed -i "s|cmake_prefix_path = _osp.*|cmake_prefix_path = '/usr/lib/cmake'|g" torch/utils/__init__.py
+
+  # https://bugs.archlinux.org/task/64981
+  patch -N torch/utils/cpp_extension.py "${srcdir}"/fix_include_system.patch
+
+  # Use system libuv
+  patch -Np1 -i "${srcdir}"/use-system-libuv.patch
+
+  # fix https://github.com/pytorch/vision/issues/3695
+  patch -Np1 -i "${srcdir}/fix-building-for-torchvision.patch"
+
+  # protobuf 23 requires C++17
+  find -name CMakeLists.txt | xargs sed -e 's|CXX_STANDARD 14|CXX_STANDARD 17|' -e 's|CXX_STANDARD 11|CXX_STANDARD 17|' -i
+
+  # Sort includes to workaround conflicting _Float16 definitions https://forums.developer.nvidia.com/t/including-cub-header-breakes-compilation-with-gcc-12-and-sse2-or-better/255018
+  patch -Np1 -i "${srcdir}/protobuf-23.patch"
+
 }
 
 build() {
@@ -82,10 +114,13 @@ build() {
   export PYTORCH_BUILD_NUMBER=1
   export PYTORCH_BUILD_VERSION="${_pkgver}"
   # modify to your needs, you don't need to compile for all GPU arch; and check cuda compatibility
-  # export TORCH_CUDA_ARCH_LIST="6.0;6.0+PTX;6.1;6.1+PTX;6.2;6.2+PTX;7.0;7.0+PTX;7.2;7.2+PTX;7.5;7.5+PTX;8.0;8.0+PTX;8.6;8.6+PTX;8.7;8.7+PTX;8.9;8.9+PTX;9.0;9.0+PTX"
+  # export TORCH_CUDA_ARCH_LIST="6.0;6.0+PTX;6.1;6.1+PTX;6.2;6.2+PTX;7.0;7.0+PTX;7.2;7.2+PTX;7.5;7.5+PTX;8.0;8.0+PTX;8.6;8.6+PTX;8.9;8.9+PTX;9.0;9.0+PTX"
   export TORCH_CUDA_ARCH_LIST="8.9;8.9+PTX"
   export TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
   export USE_CAFFE2_OPS=ON
+  export USE_CUPTI_SO=ON  # make sure cupti.so is used as shared lib
+  export CC=/usr/bin/gcc-12
+  export CXX=/usr/bin/g++-12
   export USE_DISTRIBUTED=ON
   export USE_FBGEMM=ON
   export USE_FFMPEG=ON
@@ -115,10 +150,14 @@ build() {
   export USE_CUDA=ON
   export USE_CUDNN=ON
   export USE_NCCL=ON
-  export CXXFLAGS="-Wfatal-errors -w -fpermissive $CXXFLAGS"
+  export BAZEL_CXXOPTS="-std=c++17:-Wfatal-errors:-w:-fpermissive:$BAZEL_CXXOPTS"
+  export CXXFLAGS="-Wfatal-errors -w -fpermissive --std=c++17 $CXXFLAGS"
   export CFLAGS="-Wfatal-errors -w -fpermissive $CFLAGS"
   cd "${srcdir}/${_pkgname}-uvm"
-  python setup.py build
+  # this horrible hack is necessary because the current release
+  # ships inconsistent CMake which tries to build objects before
+  # thier dependencies, build twice when dependencies are available
+  python setup.py build || python setup.py build
 }
 
 _package() {
@@ -154,9 +193,6 @@ _package() {
 
 package() {
   pkgdesc='Tensors and Dynamic neural networks in Python with strong GPU acceleration (with CUDA and MKL-DNN)'
-  depends+=(
-    'magma'
-  )
   conflicts=(python-pytorch python-pytorch-cuda python-pytorch-git)
   provides=(python-pytorch=${pkgver} python-pytorch-cuda=${pkgver})
 
