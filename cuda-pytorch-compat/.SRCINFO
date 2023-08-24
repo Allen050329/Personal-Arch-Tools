@@ -13,7 +13,6 @@ pkgbase = cuda-pytorch-compat
 	optdepends = gdb: for cuda-gdb
 	optdepends = java-runtime: for nsight and nvvp
 	provides = cuda=12.1.1
-	replaces = cuda=12.1.1
 	options = !strip
 	options = staticlibs
 	source = http://developer.download.nvidia.com/compute/cuda/12.1.1/local_installers/cuda_12.1.1_530.30.02_linux.run

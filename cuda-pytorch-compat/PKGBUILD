@@ -15,7 +15,6 @@ arch=('x86_64')
 url="https://developer.nvidia.com/cuda-zone"
 license=('custom:NVIDIA')
 depends=('gcc12' 'opencl-nvidia' 'nvidia-utils' 'python')
-replaces=(cuda=$pkgver)
 provides=(cuda=$pkgver)
 optdepends=('gdb: for cuda-gdb'
             'java-runtime: for nsight and nvvp')
