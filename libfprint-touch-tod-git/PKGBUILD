@@ -5,12 +5,12 @@
 # Contributor: Thomas Baechler <thomas@archlinux.org>
 # Contributor: Ivan Shapovalov <intelfx@intelfx.name>
 
-pkgname=libfprint-touch-elan-git
-_pkgdirname=libfprint-touch-elan
+pkgname=libfprint-touch-tod-git
+_pkgdirname=libfprint-touch-tod
 epoch=1
 pkgver=1.94.6
 pkgrel=1
-pkgdesc="Library for ELAN fingerprint readers, using touch instead of swipe"
+pkgdesc="Library for fingerprint readers, using touch instead of swipe for most fp readers. Also uses pesistent storage funtionality slated for 1.95.0 on libfprint"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
 license=(LGPL)
@@ -20,7 +20,7 @@ checkdepends=(python python-cairo python-gobject 'umockdev>=0.13.2')
 provides=(libfprint libfprint-tod libfprint-2.so libfprint-2-tod.so)
 conflicts=(libfprint libfprint-tod)
 groups=(fprint)
-source=("git+https://github.com/Allen050329/libfprint-touch-elan.git")
+source=("git+https://github.com/Allen050329/libfprint-touch-tod.git")
 sha256sums=('SKIP')
 
 build() {

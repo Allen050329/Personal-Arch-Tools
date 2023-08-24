@@ -1,5 +1,5 @@
-pkgbase = libfprint-touch-elan-git
-	pkgdesc = Library for ELAN fingerprint readers, using touch instead of swipe
+pkgbase = libfprint-touch-tod-git
+	pkgdesc = Library for fingerprint readers, using touch instead of swipe for most fp readers. Also uses pesistent storage funtionality slated for 1.95.0 on libfprint
 	pkgver = 1.94.6
 	pkgrel = 1
 	epoch = 1
@@ -26,7 +26,7 @@ pkgbase = libfprint-touch-elan-git
 	provides = libfprint-2-tod.so
 	conflicts = libfprint
 	conflicts = libfprint-tod
-	source = git+https://github.com/Allen050329/libfprint-touch-elan.git
+	source = git+https://github.com/Allen050329/libfprint-touch-tod.git
 	sha256sums = SKIP
 
-pkgname = libfprint-touch-elan-git
+pkgname = libfprint-touch-tod-git
