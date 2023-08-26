@@ -43,10 +43,6 @@ makedepends=(
 )
 source=(
   "${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm"
-  fix-building-for-torchvision.patch
-  fix_include_system.patch
-  protobuf-23.patch
-  use-system-libuv.patch
 )
 sha512sums=('SKIP'
             'e58c4991723b1aa57eb6ccabadccc85263484adbb2327014396b41aa228cf38c7344e3c3eb132dd374791699bdd3a06412e1da6cab802d28fb9992fc7e68fb14'
@@ -64,25 +60,6 @@ prepare() {
   # It will result in the same package, don't worry.
   git submodule sync
   git submodule update --init --recursive
-
-  # Fix cmake prefix path (FS#78665)
-  sed -i "s|cmake_prefix_path = _osp.*|cmake_prefix_path = '/usr/lib/cmake'|g" torch/utils/__init__.py
-
-  # https://bugs.archlinux.org/task/64981
-  patch -N torch/utils/cpp_extension.py "${srcdir}"/fix_include_system.patch
-
-  # Use system libuv
-  patch -Np1 -i "${srcdir}"/use-system-libuv.patch
-
-  # fix https://github.com/pytorch/vision/issues/3695
-  patch -Np1 -i "${srcdir}/fix-building-for-torchvision.patch"
-
-  # protobuf 23 requires C++17
-  find -name CMakeLists.txt | xargs sed -e 's|CXX_STANDARD 14|CXX_STANDARD 17|' -e 's|CXX_STANDARD 11|CXX_STANDARD 17|' -i
-
-  # Sort includes to workaround conflicting _Float16 definitions https://forums.developer.nvidia.com/t/including-cub-header-breakes-compilation-with-gcc-12-and-sse2-or-better/255018
-  patch -Np1 -i "${srcdir}/protobuf-23.patch"
-
 }
 
 build() {
@@ -95,8 +72,13 @@ build() {
   # https://github.com/pytorch/pytorch/issues/28060
   find -name '*.cpp' -exec sed -i '/tp_print/s/nullptr/0/' {} +
 
+  # protobuf 23 requires C++17
+  find -name CMakeLists.txt | xargs sed -e 's|CXX_STANDARD 14|CXX_STANDARD 17|' -e 's|CXX_STANDARD 11|CXX_STANDARD 17|' -i
+
+  # Fix cmake prefix path (FS#78665)
+  sed -i "s|cmake_prefix_path = _osp.*|cmake_prefix_path = '/usr/lib/cmake'|g" torch/utils/__init__.py
+
   # Check tools/setup_helpers/cmake.py, setup.py and CMakeLists.txt for a list of flags that can be set via env vars.
-  export _GLIBCXX_USE_CXX11_ABI=1
   export BUILD_BINARY=ON
   export BUILD_CAFFE2_OPS=ON
   export BUILD_CUSTOM_PROTOBUF=OFF
@@ -115,7 +97,14 @@ build() {
   export PYTORCH_BUILD_VERSION="${_pkgver}"
   # modify to your needs, you don't need to compile for all GPU arch; and check cuda compatibility
   # export TORCH_CUDA_ARCH_LIST="6.0;6.0+PTX;6.1;6.1+PTX;6.2;6.2+PTX;7.0;7.0+PTX;7.2;7.2+PTX;7.5;7.5+PTX;8.0;8.0+PTX;8.6;8.6+PTX;8.9;8.9+PTX;9.0;9.0+PTX"
-  export TORCH_CUDA_ARCH_LIST="8.9;8.9+PTX"
+  compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader) # TODO: Fix for people who have with different compute capabilities in the same machine
+  if (( $(echo "$compute_cap > 5.99" |bc -l) )); then
+    export TORCH_CUDA_ARCH_LIST="$compute_cap;$compute_cap+PTX"
+  else
+    echo "Compute capability $compute_cap is less than 6.0, which means it doesn't support UVM. Please use normal pytorch."
+    sleep 3
+    exit 1
+  fi
   export TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
   export USE_CAFFE2_OPS=ON
   export USE_CUPTI_SO=ON  # make sure cupti.so is used as shared lib
@@ -151,8 +140,8 @@ build() {
   export USE_CUDNN=ON
   export USE_NCCL=ON
   export BAZEL_CXXOPTS="-std=c++17:-Wfatal-errors:-w:-fpermissive:$BAZEL_CXXOPTS"
-  export CXXFLAGS="-Wfatal-errors -w -fpermissive --std=c++17 $CXXFLAGS"
-  export CFLAGS="-Wfatal-errors -w -fpermissive $CFLAGS"
+  export CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive -std=c++17"
+  export CFLAGS="$CFLAGS -Wfatal-errors -w -fpermissive"
   cd "${srcdir}/${_pkgname}-uvm"
   # this horrible hack is necessary because the current release
   # ships inconsistent CMake which tries to build objects before
