@@ -44,11 +44,7 @@ makedepends=(
 source=(
   "${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm"
 )
-sha512sums=('SKIP'
-            'e58c4991723b1aa57eb6ccabadccc85263484adbb2327014396b41aa228cf38c7344e3c3eb132dd374791699bdd3a06412e1da6cab802d28fb9992fc7e68fb14'
-            'e0160e35c6e196bdfb85267ef7d8b3d81f332ca869cefb4c12541d4f891474b05b569545e7913c9d8628ce561c6adea121132826e380db3ff2a7a62676d3be46'
-            'b37d32d3bc005a68e5ebb40c42396214d75595f00e59c59719fc7fe1eabcff436f34520fb66aa671aa72ac5c5b534bc77dc6558c726a9c7978a39a9b569ca270'
-            'ad2046b1870975054b8ddcb773197abcf0de9d5a4245cf87a0cb2965e080a7182b82044c7f242e2ef342bf8c6a796efd05c5161c380f18330c4e13404a4efa87')
+sha512sums=('SKIP')
 
 prepare() {
   cd "${_pkgname}-uvm"
@@ -80,7 +76,8 @@ build() {
 
   # Check tools/setup_helpers/cmake.py, setup.py and CMakeLists.txt for a list of flags that can be set via env vars.
   export BUILD_BINARY=ON
-  export BUILD_CAFFE2_OPS=ON
+  export BUILD_CAFFE2_OPS=OFF
+  export BUILD_CAFFE2=OFF
   export BUILD_CUSTOM_PROTOBUF=OFF
   export BUILD_DOCS=ON
   export BUILDING_WITH_TORCH_LIBS=ON
