@@ -43,8 +43,12 @@ makedepends=(
 )
 source=(
   "${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm"
+  '87773.patch'
 )
-sha512sums=('SKIP')
+sha512sums=(
+  'SKIP'
+  ''
+)
 
 prepare() {
   cd "${_pkgname}-uvm"
@@ -60,7 +64,10 @@ prepare() {
 
 build() {
   cd "${_pkgname}-uvm"
-  
+
+  # Fix building against glog 0.6
+  patch -Np1 -i "${srcdir}/87773.patch"
+
   # https://github.com/pytorch/pytorch/issues/26555
   sed -i 's#^  ${CMAKE_CURRENT_SOURCE_DIR}/tensor_iterator_test.cpp##g' aten/src/ATen/test/CMakeLists.txt
 
