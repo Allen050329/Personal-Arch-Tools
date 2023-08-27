@@ -45,10 +45,8 @@ source=(
   "${_pkgname}-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm"
   '87773.patch'
 )
-sha512sums=(
-  'SKIP'
-  ''
-)
+sha512sums=('SKIP'
+            '4cd3615ef664ae8e9d584a975e7368f1e4dc557c524850bad420932502c4567fbca0add5f34a65d31ba40796fe3f6698a0f1e74eb39e8b8c12230661e3036a5f')
 
 prepare() {
   cd "${_pkgname}-uvm"
@@ -161,7 +159,7 @@ _package() {
 
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
-  pytorchpath="usr/lib/python$(get_pyver)/site-packages/torch"
+  pytorchpath="usr/lib/python$(python -c 'import sys; version = ".".join(map(str, sys.version_info[:2])); print(version)')/site-packages/torch"
   install -d "${pkgdir}/usr/lib"
 
   # put CMake files in correct place

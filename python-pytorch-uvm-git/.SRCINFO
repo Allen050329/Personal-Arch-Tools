@@ -35,7 +35,9 @@ pkgbase = python-pytorch-uvm-git
 	depends = python-filelock
 	depends = python-sympy
 	source = pytorch-uvm::git+https://github.com/Allen050329/pytorch-uvm.git#branch=uvm
+	source = 87773.patch
 	sha512sums = SKIP
+	sha512sums = 4cd3615ef664ae8e9d584a975e7368f1e4dc557c524850bad420932502c4567fbca0add5f34a65d31ba40796fe3f6698a0f1e74eb39e8b8c12230661e3036a5f
 
 pkgname = python-pytorch-uvm-git
 	pkgdesc = Tensors and Dynamic neural networks in Python with strong GPU acceleration (with CUDA and MKL-DNN)
