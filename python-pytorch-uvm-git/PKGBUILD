@@ -176,9 +176,9 @@ _package() {
   rm -rf "${pkgdir}/usr/include/pybind11"
 
   # python module is hardcoded to look there at runtime
-  ln -s /usr/include "${pkgdir}/${pytorchpath}/include"
+  ln -sf /usr/include "${pkgdir}/${pytorchpath}/include"
   find "${pkgdir}"/usr/lib -type f -name "*.so*" -print0 | while read -rd $'\0' _lib; do
-    ln -s ${_lib#"$pkgdir"} "${pkgdir}/${pytorchpath}/lib/"
+    ln -sf ${_lib#"$pkgdir"} "${pkgdir}/${pytorchpath}/lib/"
   done
 }
 
