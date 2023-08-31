@@ -142,8 +142,8 @@ build() {
   export USE_CUDA=ON
   export USE_CUDNN=ON
   export USE_NCCL=ON
-  export BAZEL_CXXOPTS="-std=c++17:-Wfatal-errors:-w:-fpermissive:$BAZEL_CXXOPTS"
-  export CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive -std=c++17"
+  export BAZEL_CXXOPTS="-Wfatal-errors:-w:-fpermissive:$BAZEL_CXXOPTS"
+  export CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive"
   export CFLAGS="$CFLAGS -Wfatal-errors -w -fpermissive"
   cd "${srcdir}/${_pkgname}-uvm"
   # this horrible hack is necessary because the current release
