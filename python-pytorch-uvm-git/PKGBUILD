@@ -58,10 +58,6 @@ prepare() {
   # It will result in the same package, don't worry.
   git submodule sync
   git submodule update --init --recursive
-}
-
-build() {
-  cd "${_pkgname}-uvm"
 
   # Fix building against glog 0.6
   patch -Np1 -i "${srcdir}/87773.patch"
@@ -78,6 +74,11 @@ build() {
 
   # Fix cmake prefix path (FS#78665)
   sed -i "s|cmake_prefix_path = _osp.*|cmake_prefix_path = '/usr/lib/cmake'|g" torch/utils/__init__.py
+
+}
+
+build() {
+  cd "${_pkgname}-uvm"
 
   # Check tools/setup_helpers/cmake.py, setup.py and CMakeLists.txt for a list of flags that can be set via env vars.
   export BUILD_BINARY=ON
@@ -99,7 +100,7 @@ build() {
   export PYTORCH_BUILD_VERSION="${_pkgver}"
   # modify to your needs, you don't need to compile for all GPU arch; and check cuda compatibility
   # export TORCH_CUDA_ARCH_LIST="6.0;6.0+PTX;6.1;6.1+PTX;6.2;6.2+PTX;7.0;7.0+PTX;7.2;7.2+PTX;7.5;7.5+PTX;8.0;8.0+PTX;8.6;8.6+PTX;8.9;8.9+PTX;9.0;9.0+PTX"
-  compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader) # TODO: Fix for people who have with different compute capabilities in the same machine
+  compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader) # TODO: Fix for people who have GPUs with different compute capabilities in the same machine
   if (( $(echo "$compute_cap > 5.99" |bc -l) )); then
     export TORCH_CUDA_ARCH_LIST="$compute_cap;$compute_cap+PTX"
   else
