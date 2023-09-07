@@ -1,0 +1,32 @@
+pkgbase = libfprint-touch-tod-git
+	pkgdesc = Library for fingerprint readers, using touch instead of swipe for most fp readers. Also uses pesistent storage funtionality slated for 1.95.0 on libfprint
+	pkgver = 1.94.6
+	pkgrel = 1
+	epoch = 1
+	url = https://fprint.freedesktop.org/
+	arch = x86_64
+	groups = fprint
+	license = LGPL
+	checkdepends = python
+	checkdepends = python-cairo
+	checkdepends = python-gobject
+	checkdepends = umockdev>=0.13.2
+	makedepends = git
+	makedepends = meson
+	makedepends = gtk-doc
+	makedepends = gobject-introspection
+	makedepends = systemd
+	depends = libgusb
+	depends = pixman
+	depends = nss
+	depends = systemd-libs
+	provides = libfprint
+	provides = libfprint-tod
+	provides = libfprint-2.so
+	provides = libfprint-2-tod.so
+	conflicts = libfprint
+	conflicts = libfprint-tod
+	source = git+https://github.com/Allen050329/libfprint-touch-tod.git
+	sha256sums = SKIP
+
+pkgname = libfprint-touch-tod-git

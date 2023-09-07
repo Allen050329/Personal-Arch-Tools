@@ -1,0 +1,10 @@
+post_install() {
+    echo "The cusparselt libraries are in /opt/cuda/targets/x86_64-linux/lib"
+    echo "The cusparselt headers are in /opt/cuda/targets/x86_64-linux/include"
+    echo "You need to relogin in order for the cuda binaries to appear in your PATH"
+    post_upgrade
+}
+
+post_upgrade() {
+    ldconfig -r .
+}

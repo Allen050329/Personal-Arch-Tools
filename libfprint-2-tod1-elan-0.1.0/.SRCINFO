@@ -1,0 +1,17 @@
+pkgbase = libfprint-2-tod1-elan
+	pkgdesc = Proprietary driver for the Elan fingerprint reader dev-id 0x0c4b - direct from Lenovo's site
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://support.lenovo.com/us/en/downloads/ds560935-elan-fingerprint-driver-for-linux-thinkpad-e14-gen-4-thinkpad-e15-gen-4
+	arch = x86_64
+	groups = fprint
+	license = unknown
+	makedepends = unzip
+	depends = libfprint-tod
+	depends = openssl-1.1
+	source = https://download.lenovo.com/pccbbs/mobiles/r1sle01w.zip
+	source = 60-libfprint-2-tod1-elan.rules
+	sha256sums = d946267aff6b7fcd6781e43858c1906be46a5ec54fc6d7ece8d841c553064860
+	sha256sums = 0a33ffb26eb537861c5a3e35a611c7b3d8f2be0fb46ba8dd84e44e3d15279895
+
+pkgname = libfprint-2-tod1-elan

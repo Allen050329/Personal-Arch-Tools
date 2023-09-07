@@ -1,0 +1,9 @@
+cudaroot=/opt/cuda
+libdir=${cudaroot}/cusparselt/lib
+includedir=${cudaroot}/cusparselt/include
+
+Name: cusparseLt
+Description: CUDA Sparse Matrix-Matrix Multiplication Library
+Version: 0.4.0.7
+Libs: -L${libdir} -lcusparse
+Cflags: -I${includedir}

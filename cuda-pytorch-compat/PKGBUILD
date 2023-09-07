@@ -1,0 +1,118 @@
+# Maintainer: Zenphyrnix <zenphyrnixcloud@proton.me>
+# Contributor: Mateen Ulhaq <mulhaq2005+aur at gmail dot com>
+
+_major=12
+_minor=1
+_patch=1
+pkgname=cuda-pytorch-compat
+_pkgname=cuda
+pkgver=12.1.1
+_driverver=530.30.02
+_reqdriverver=455.32
+pkgrel=1
+pkgdesc="NVIDIA's GPU programming toolkit"
+arch=('x86_64')
+url="https://developer.nvidia.com/cuda-zone"
+license=('custom:NVIDIA')
+depends=('gcc12' 'opencl-nvidia' 'nvidia-utils' 'python')
+provides=(cuda=$pkgver)
+optdepends=('gdb: for cuda-gdb'
+            'java-runtime: for nsight and nvvp')
+options=(strip !staticlibs)
+install=cuda.install
+# See https://developer.nvidia.com/cuda-12-1-1-download-archive 
+source=(
+  "http://developer.download.nvidia.com/compute/cuda/${pkgver}/local_installers/cuda_${pkgver}_${_driverver}_linux.run"
+  # "cuda-findgllib_mk.diff"
+  *.pc
+  cuda.sh
+  cuda.conf
+)
+sha256sums=('d74022d41d80105319dfa21beea39b77a5b9919539c0487a05caaf2446d6a70e'
+            '6a9eb24f3a49647ad18497c7b712a331fa912bdfa8f2c9ed0e49e490a9fa6a94'
+            '4bd1a1fd8df55b0000c8d0dd56ca9b1dbdd34ce2519813608cdcfe154e3b6ec2'
+            '3fbbe6bc9c506f61b7927786424823a7ab853c150668a2d21bb0d440fcaf51a4'
+            '7cff9c16bb0b5bec54437958bd020d4a2e16548b443cea335879e81904180c2f'
+            '97ef8715e1d59280b89e357a8ac5bf04f7ba9a72fdafb04a9eeb7cb3339dabe1'
+            '7a372131a69eea4aee8e745b733a85cdd0aa648e12fe578b8850a28e9785141b'
+            '39595395b225e242dc833000b89ec42277203c477cb1d34c8fd3514b180d46f5'
+            'c7a251a21be553b6b0cb7c367aa4077ef14a2dffb6e6cf7ace7586bd93cbc4ea'
+            '13ad144341262aa7848366e937ad49a56ece30c756f01d774543a2ec62ebd257'
+            '8116e974d3039447d683cb3d6adceab7d1ea488e6d142152a0729742ff29a173'
+            'f4119511330d9e52548d5838c05a6c71abbd5e5c5b8a3d8256aa64363899054e'
+            '82de445130441125359b27fd450f458e6850443c62b28b225b8a3875e7e60239'
+            'f0a8a7af0109a51d9f3b649974348a462e17c636ac58fa629b0ee93936d2bdfd'
+            '3d045eace7e04ecc5c283998424b202d4c18cab892d8ebc1be5fee9cb227a215'
+            'a4d00940a91df35c5e7d72621e677e8d181142db7f124189e04dcd3c97c0e4e2'
+            'e673f48fe72b7e45d804474487903e1895c27028ef9e989430b9dc60d58ffee2'
+            '7ec050fe40262cf3c91db5c7e497a50507f613835bb8262400126af23e1b746d'
+            'd01fc32c5ac651a6a06b37509c33da81a77e2995d88099ff8ec4a649e9508c06'
+            '4329880b18c1a7a877da0518275955c27df8c213838bfbefe382a1efac0ca468'
+            '3ca9a96c9678ba9d1a4f2318a5cdb56895fbe58a28db4861628bfb8a1076da41'
+            '115e20dd224a5809bb8a13a2b10bc8149731088cae61d847a711a26ecfca4eef'
+            '11343df0d5ec20965ac4d762f16fe6223b560d62b41ddabc92e9bd1fb2039b9e'
+            'c0316bd64d799994c1203e0a36ed29467b9cb360e08cb5883cf16026ecfad60d'
+            '5f9113425e833a80459a3678aa9612cad605be6b1326ef990117ef31facdc4b1'
+            '30839a6a2aa7ced7b8828abd8dfabf7dc5d566c9adbf63f37ea02a78987b1c6c'
+            '19d71f8edfd0e262ec8de62e26edf7df480b652cfd88e55252ecdbe68693ceed'
+            '996245eec189a76c712c38b31e66dcde18025e2e973da644d64fdb4385105a4b'
+            '3a64a964d0e0712298d6c1f7714ac366d9e9c845cc1ba88651e696d6e7e6e494'
+            'fb46da1f88aeab5c5e697a668842fe65e392ba93bb20f86f51f83f9d1963110f'
+            'a65f7d96e2447eb40b1be9586b90eb0bd776a8938c93d21f9606d2880b548b28')
+
+
+prepare() {
+  sh cuda_${pkgver}_${_driverver}_linux.run --target "${srcdir}" --noexec
+
+  # Fix up samples tht use findgllib_mk
+  # for f in builds/cuda_samples/*/*/findgllib.mk; do
+  #   patch $f cuda-findgllib_mk.diff
+  # done
+}
+
+package() {
+  _target_dir="${pkgdir}/opt/cuda"
+  cd "${srcdir}/builds"
+
+  rm -r NVIDIA*.run bin
+  mkdir -p "${_target_dir}/extras"
+  # mv cuda_samples "${_target_dir}/samples"
+  mv integration nsight_compute nsight_systems EULA.txt "${_target_dir}"
+  mv cuda_sanitizer_api/compute-sanitizer "${_target_dir}/extras/compute-sanitizer"
+  rmdir cuda_sanitizer_api
+  for lib in *; do
+    echo "copying $lib/*  ==>  ${_target_dir}/"
+    if [ -d $lib ]; then
+      cp -r $lib/* "${_target_dir}/"
+    else
+      cp $lib "${_target_dir}/"
+    fi
+  done
+
+  # Define compilers for CUDA to use.
+  # This allows us to use older versions of GCC if we have to.
+  ln -s /usr/bin/gcc-12 "${_target_dir}/bin/gcc"
+  ln -s /usr/bin/g++-12 "${_target_dir}/bin/g++"
+
+  # Install pkgconfig files
+  mkdir -p "$pkgdir"/usr/lib/pkgconfig
+  for file in "${srcdir}"/*.pc; do
+    file_name="$(basename $file)"
+    cp "$file" "${pkgdir}"/usr/lib/pkgconfig/"${file_name%.pc}.pc"
+  done
+
+  mkdir -p "${pkgdir}/usr/share/licenses/${_pkgname}"
+  ln -s /opt/cuda/doc/pdf/EULA.pdf "${pkgdir}/usr/share/licenses/${_pkgname}/EULA.pdf"
+
+  # Fix Makefile paths to CUDA
+  for f in $(find "$_target_dir" -name Makefile); do
+    sed -i "s|/usr/local/cuda|/opt/cuda|g" "$f"
+  done
+
+  # NVIDIA has trouble with counting and numbering
+  # as well as the elusive concept of a SONAME so...
+  ln -s /opt/cuda/targets/x86_64-linux/lib/libcudart.so.${_major}.${_minor}.${_patch} "${_target_dir}/targets/x86_64-linux/lib/libcudart.so.${_major}.${_minor}"
+
+  install -Dm755 "$srcdir/$_pkgname.sh" "$pkgdir/etc/profile.d/$_pkgname.sh"
+  install -Dm755 "$srcdir/$_pkgname.conf" "$pkgdir/etc/ld.so.conf.d/$_pkgname.conf"
+}

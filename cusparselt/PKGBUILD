@@ -1,0 +1,41 @@
+# Maintainer: Zenphyrnix <zenphyrnixcloud@proton.me>
+# Contributor: Mateen Ulhaq <mulhaq2005+aur at gmail dot com>
+
+pkgname=cusparselt
+_pkgname=cusparselt
+pkgver=0.4.0
+upkgrev=7
+pkgrel=1
+pkgdesc="NVIDIA's GPU programming toolkit"
+arch=('x86_64')
+url="https://developer.nvidia.com/cuda-zone"
+license=('custom:NVIDIA')
+depends=('gcc12' 'opencl-nvidia' 'nvidia-utils' 'cuda>=11.4')
+optdepends=()
+options=(!strip staticlibs)
+install=cusparselt.install
+# See https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-x86_64/libcusparse_lt-linux-x86_64-0.4.0.7-archive.tar.xz 
+source=(
+  "https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-x86_64/libcusparse_lt-linux-x86_64-$pkgver.$upkgrev-archive.tar.xz"
+  cusparselt.pc
+)
+sha256sums=('15fc65cddcc76dceec41985a0737bc055c3944eadd02589ec8883f1196911f78'
+            'd0cebccfcfb37133173ebfe14e40e86f21da94ed7caa01e6167f9ff033ac0175')
+
+package() {
+  _target_dir="${pkgdir}/opt/cuda/${pkgname}"
+  cd "${srcdir}"
+  mkdir -p "${_target_dir}/"
+  mkdir -p "$pkgdir"/usr/lib/pkgconfig
+  for file in "${srcdir}"/*.pc; do
+    file_name="$(basename $file)"
+    cp "$file" "${pkgdir}"/usr/lib/pkgconfig/"${file_name%.pc}.pc"
+  done
+
+  mkdir -p "${pkgdir}/usr/share/licenses/${_pkgname}"
+  for lib in "libcusparse_lt-linux-x86_64-0.4.0.7-archive/*"; do
+    echo "copying $lib/*  ==>  ${_target_dir}/"
+    cp -a $lib "${_target_dir}/"
+  done
+  ln -s $_target_dir/LICENSE "${pkgdir}/usr/share/licenses/${_pkgname}"
+}
