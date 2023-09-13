@@ -1,8 +1,8 @@
 # Maintainer: Zenphyrnix <zenphyrnixcloud@proton.me>
 pkgname='python-pytorch-uvm-git'
 _pkgname='pytorch'
-_pkgver=2.0.1
-pkgver=2.0.1
+_pkgver=2.99.99
+pkgver=2.99.99
 pkgrel=1
 pkgdesc='Tensors and Dynamic neural networks in Python with strong GPU acceleration'
 arch=('x86_64')
@@ -78,76 +78,18 @@ prepare() {
 }
 
 build() {
-  cd "${_pkgname}-uvm"
+  cd "${srcdir}/${_pkgname}-uvm"
 
   # Check tools/setup_helpers/cmake.py, setup.py and CMakeLists.txt for a list of flags that can be set via env vars.
-  export BUILD_BINARY=ON
-  export BUILD_CAFFE2_OPS=OFF
-  export BUILD_CAFFE2=OFF
-  export BUILD_CUSTOM_PROTOBUF=OFF
-  export BUILD_DOCS=ON
-  export BUILDING_WITH_TORCH_LIBS=ON
-  export BUILD_JNI=OFF
-  export BUILD_NAMEDTENSOR=ON
-  export BUILD_SHARED_LIBS=ON
-  export BUILD_TEST=OFF
-  export CAFFE2_STATIC_LINK_CUDA=OFF
-  export CUDA_HOME=/opt/cuda
-  export CUDAHOSTCXX=/opt/cuda/bin/g++
-  export CUDNN_INCLUDE_DIR=/usr/include
-  export CUDNN_LIB_DIR=/usr/lib
-  export PYTORCH_BUILD_NUMBER=1
-  export PYTORCH_BUILD_VERSION="${_pkgver}"
   compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader) # TODO: Fix for people who have GPUs with different compute capabilities in the same machine
   if (( $(echo "$compute_cap > 5.99" |bc -l) )); then
-    export TORCH_CUDA_ARCH_LIST="$compute_cap;$compute_cap+PTX"
+    TORCH_CUDA_ARCH_LIST="$compute_cap;$compute_cap+PTX" BUILD_BINARY=ON BUILD_CAFFE2_OPS=OFF BUILD_CAFFE2=OFF BUILD_CUSTOM_PROTOBUF=ON BUILD_DOCS=ON BUILDING_WITH_TORCH_LIBS=ON BUILD_JNI=OFF USE_CUSPARSELT=1 BUILD_NAMEDTENSOR=ON BUILD_SHARED_LIBS=ON BUILD_FUNCTORCH=ON BUILD_NVFUSER=ON BUILD_TEST=OFF CAFFE2_STATIC_LINK_CUDA=OFF CUDA_HOME=/opt/cuda CUDAHOSTCXX=/usr/bin/g++-12 CUDNN_INCLUDE_DIR=/usr/include CUDNN_LIB_DIR=/usr/lib PYTORCH_BUILD_NUMBER=1 TORCH_NVCC_FLAGS="-Xfatbin -compress-all" USE_CAFFE2_OPS=OFF USE_CUPTI_SO=ON USE_FLASH_ATTENTION=1 USE_MEM_EFF_ATTENTION=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ USE_DISTRIBUTED=ON USE_FBGEMM=ON USE_FFMPEG=ON USE_LEVELDB=ON USE_LITE_PROTO=OFF USE_LMDB=ON USE_NATIVE_ARCH=ON USE_NNPACK=ON USE_NUMPY=ON USE_NVRTC=ON USE_OPENCV=ON USE_OPENMP=ON USE_QNNPACK=ON USE_ROCM=OFF USE_STATIC_NCCL=OFF USE_SYSTEM_EIGEN_INSTALL=ON USE_SYSTEM_NCCL=ON USE_TBB=ON USE_ZMQ=ON USE_ZSTD=ON USE_TENSORPIPE=ON VERBOSE=1 USE_CUDA=ON USE_CUDNN=ON USE_NCCL=ON CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive -std=gnu++17" CFLAGS="$CFLAGS -Wfatal-errors -w -fpermissive" python setup.py build || TORCH_CUDA_ARCH_LIST="$compute_cap;$compute_cap+PTX" BUILD_BINARY=ON BUILD_CAFFE2_OPS=OFF BUILD_CAFFE2=OFF BUILD_CUSTOM_PROTOBUF=ON BUILD_DOCS=ON BUILDING_WITH_TORCH_LIBS=ON BUILD_JNI=OFF USE_CUSPARSELT=1 BUILD_NAMEDTENSOR=ON BUILD_SHARED_LIBS=ON BUILD_FUNCTORCH=ON BUILD_NVFUSER=ON BUILD_TEST=OFF CAFFE2_STATIC_LINK_CUDA=OFF CUDA_HOME=/opt/cuda CUDAHOSTCXX=/usr/bin/g++-12 CUDNN_INCLUDE_DIR=/usr/include CUDNN_LIB_DIR=/usr/lib PYTORCH_BUILD_NUMBER=1 TORCH_NVCC_FLAGS="-Xfatbin -compress-all" USE_CAFFE2_OPS=OFF USE_CUPTI_SO=ON USE_FLASH_ATTENTION=1 USE_MEM_EFF_ATTENTION=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ USE_DISTRIBUTED=ON USE_FBGEMM=ON USE_FFMPEG=ON USE_LEVELDB=ON USE_LITE_PROTO=OFF USE_LMDB=ON USE_NATIVE_ARCH=ON USE_NNPACK=ON USE_NUMPY=ON USE_NVRTC=ON USE_OPENCV=ON USE_OPENMP=ON USE_QNNPACK=ON USE_ROCM=OFF USE_STATIC_NCCL=OFF USE_SYSTEM_EIGEN_INSTALL=ON USE_SYSTEM_NCCL=ON USE_TBB=ON USE_ZMQ=ON USE_ZSTD=ON USE_TENSORPIPE=ON VERBOSE=1 USE_CUDA=ON USE_CUDNN=ON USE_NCCL=ON CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive -std=gnu++17" CFLAGS="$CFLAGS -Wfatal-errors -w -fpermissive" python setup.py build
   else
     echo "Compute capability $compute_cap is less than 6.0, which means it doesn't support UVM. Please use normal pytorch."
     sleep 3
     exit 1
   fi
-  export TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
-  export USE_CAFFE2_OPS=ON
-  export USE_CUPTI_SO=ON  # make sure cupti.so is used as shared lib
-  export CC=/usr/bin/gcc-12
-  export CXX=/usr/bin/g++-12
-  export USE_DISTRIBUTED=ON
-  export USE_FBGEMM=ON
-  export USE_FFMPEG=ON
-  export USE_GFLAGS=ON
-  export USE_GLOG=ON
-  export USE_GLOO=ON
-  export USE_LEVELDB=ON
-  export USE_LITE_PROTO=OFF
-  export USE_LMDB=ON
-  export USE_NATIVE_ARCH=ON
-  export USE_NNPACK=ON
-  export USE_NUMPY=ON
-  export USE_NVRTC=ON
-  export USE_OPENCV=ON
-  export USE_OPENMP=ON
-  export USE_QNNPACK=ON
-  export USE_ROCM=OFF
-  export USE_STATIC_NCCL=OFF
-  export USE_SYSTEM_EIGEN_INSTALL=ON
-  export USE_SYSTEM_NCCL=ON
-  export USE_TBB=ON
-  export USE_ZMQ=ON
-  export USE_ZSTD=ON
-  export USE_TENSORRT=ON
-  export USE_TENSORPIPE=ON
-  export VERBOSE=1
-  export USE_CUDA=ON
-  export USE_CUDNN=ON
-  export USE_NCCL=ON
-  export BAZEL_CXXOPTS="$BAZEL_CXXOPTS:-Wfatal-errors:-w:-fpermissive"
-  export CXXFLAGS="$CXXFLAGS -Wfatal-errors -w -fpermissive"
-  export CFLAGS="$CFLAGS -Wfatal-errors -w -fpermissive"
-  cd "${srcdir}/${_pkgname}-uvm"
-  # this horrible hack is necessary because the current release
-  # ships inconsistent CMake which tries to build objects before
-  # thier dependencies, build twice when dependencies are available
-  python setup.py build || python setup.py build
+
 }
 
 _package() {
