@@ -1,0 +1,4859 @@
+diff --git a/configure.ac b/configure.ac
+index 3eef744e..def9e346 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -80,6 +80,11 @@ AC_ARG_ENABLE(glamor, AS_HELP_STRING([--enable-glamor],
+               [], [enable_glamor=no])
+ AM_CONDITIONAL(WITH_GLAMOR, [test x$enable_glamor = xyes])
+ 
++AC_ARG_ENABLE(lrandr, AS_HELP_STRING([--enable-lrandr],
++              [Use local randr (default: no)]),
++              [], [enable_lrandr=no])
++AM_CONDITIONAL(WITH_LRANDR, [test x$enable_lrandr = xyes])
++
+ AM_CONDITIONAL(WITH_SIMD_AMD64, [test x$simd_arch = xx86_64])
+ AM_CONDITIONAL(WITH_SIMD_X86, [test x$simd_arch = xi386])
+ 
+diff --git a/module/Makefile.am b/module/Makefile.am
+index e3e9ba5a..119c2b74 100644
+--- a/module/Makefile.am
++++ b/module/Makefile.am
+@@ -25,6 +25,12 @@ EXTRA_HEADERS += rdpEgl.h
+ EGLLIB += -lepoxy
+ endif
+ 
++if WITH_LRANDR
++EXTRA_FLAGS += -DXORGXRDP_LRANDR
++EXTRA_SOURCES += rdpLRandR.c
++EXTRA_HEADERS += rdpLRandR.h
++endif
++
+ AM_CFLAGS = \
+   $(XORG_SERVER_CFLAGS) \
+   $(XRDP_CFLAGS) \
+@@ -77,6 +83,7 @@ noinst_HEADERS = \
+   rdpXv.h \
+   amd64/funcs_amd64.h \
+   x86/funcs_x86.h \
++  wyhash.h \
+   $(EXTRA_HEADERS)
+ 
+ libxorgxrdp_la_LTLIBRARIES = libxorgxrdp.la
+diff --git a/module/amd64/Makefile.am b/module/amd64/Makefile.am
+index cd2a0204..7bff1c55 100644
+--- a/module/amd64/Makefile.am
++++ b/module/amd64/Makefile.am
+@@ -3,6 +3,7 @@ NAFLAGS += -DASM_ARCH_AMD64
+ ASMSOURCES = \
+   a8r8g8b8_to_a8b8g8r8_box_amd64_sse2.asm \
+   a8r8g8b8_to_nv12_box_amd64_sse2.asm \
++  a8r8g8b8_to_nv12_709fr_box_amd64_sse2.asm \
+   cpuid_amd64.asm \
+   i420_to_rgb32_amd64_sse2.asm \
+   uyvy_to_rgb32_amd64_sse2.asm \
+diff --git a/module/amd64/a8r8g8b8_to_nv12_709fr_box_amd64_sse2.asm b/module/amd64/a8r8g8b8_to_nv12_709fr_box_amd64_sse2.asm
+new file mode 100644
+index 00000000..c18e9d6a
+--- /dev/null
++++ b/module/amd64/a8r8g8b8_to_nv12_709fr_box_amd64_sse2.asm
+@@ -0,0 +1,304 @@
++;
++;Copyright 2015 Jay Sorg
++;
++;Permission to use, copy, modify, distribute, and sell this software and its
++;documentation for any purpose is hereby granted without fee, provided that
++;the above copyright notice appear in all copies and that both that
++;copyright notice and this permission notice appear in supporting
++;documentation.
++;
++;The above copyright notice and this permission notice shall be included in
++;all copies or substantial portions of the Software.
++;
++;THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++;IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++;FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
++;OPEN GROUP BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
++;AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++;CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++;
++;ARGB to NV12 709 full range
++;amd64 SSE2
++;
++; notes
++;   address s8 should be aligned on 16 bytes, will be slower if not
++;   width should be multiple of 8 and > 0
++;   height should be even and > 0
++
++%include "common.asm"
++
++PREPARE_RODATA
++    cd255  times 4 dd 255
++
++    cw255  times 8 dw 255
++    cw128  times 8 dw 128
++    cw54   times 8 dw 54
++    cw183  times 8 dw 183
++    cw18   times 8 dw 18
++    cw29   times 8 dw 29
++    cw99   times 8 dw 99
++    cw116  times 8 dw 116
++    cw12   times 8 dw 12
++    cw2    times 8 dw 2
++
++%define LS8            [rsp +   0] ; s8
++%define LSRC_STRIDE    [rsp +   8] ; src_stride
++%define LD8_Y          [rsp +  16] ; d8_y
++%define LDST_Y_STRIDE  [rsp +  24] ; dst_stride_y
++%define LD8_UV         [rsp +  32] ; d8_uv
++%define LDST_UV_STRIDE [rsp +  40] ; dst_stride_uv
++%define LU1            [rsp +  48] ; first line U, 8 bytes
++%define LV1            [rsp +  56] ; first line V, 8 bytes
++%define LU2            [rsp +  64] ; second line U, 8 bytes
++%define LV2            [rsp +  72] ; second line V, 8 bytes
++
++%define LWIDTH         [rsp + 104] ; width
++%define LHEIGHT        [rsp + 112] ; height
++
++;The first six integer or pointer arguments are passed in registers
++; RDI, RSI, RDX, RCX, R8, and R9
++
++;int
++;a8r8g8b8_to_nv12_709fr_box_amd64_sse2(const char *s8, int src_stride,
++;                                      char *d8_y, int dst_stride_y,
++;                                      char *d8_uv, int dst_stride_uv,
++;                                      int width, int height);
++PROC a8r8g8b8_to_nv12_709fr_box_amd64_sse2
++    push rbx
++    push rbp
++    sub rsp, 80                ; local vars, 80 bytes
++
++    mov LS8, rdi               ; s8
++    mov LSRC_STRIDE, rsi       ; src_stride
++    mov LD8_Y, rdx             ; d8_y
++    mov LDST_Y_STRIDE, rcx     ; dst_stride_y
++    mov LD8_UV, r8             ; d8_uv
++    mov LDST_UV_STRIDE, r9     ; dst_stride_uv
++
++    pxor xmm7, xmm7
++
++    mov ebx, LHEIGHT           ; ebx = height
++    shr ebx, 1                 ; doing 2 lines at a time
++
++row_loop1:
++    mov rsi, LS8               ; s8
++    mov rdi, LD8_Y             ; d8_y
++    mov rdx, LD8_UV            ; d8_uv
++
++    mov ecx, LWIDTH            ; ecx = width
++    shr ecx, 3                 ; doing 8 pixels at a time
++
++loop1:
++    ; first line
++    movdqu xmm0, [rsi]         ; 4 pixels, 16 bytes
++    movdqa xmm1, xmm0          ; blue
++    pand xmm1, [lsym(cd255)]   ; blue
++    movdqa xmm2, xmm0          ; green
++    psrld xmm2, 8              ; green
++    pand xmm2, [lsym(cd255)]   ; green
++    movdqa xmm3, xmm0          ; red
++    psrld xmm3, 16             ; red
++    pand xmm3, [lsym(cd255)]   ; red
++
++    movdqu xmm0, [rsi + 16]    ; 4 pixels, 16 bytes
++    movdqa xmm4, xmm0          ; blue
++    pand xmm4, [lsym(cd255)]   ; blue
++    movdqa xmm5, xmm0          ; green
++    psrld xmm5, 8              ; green
++    pand xmm5, [lsym(cd255)]   ; green
++    movdqa xmm6, xmm0          ; red
++    psrld xmm6, 16             ; red
++    pand xmm6, [lsym(cd255)]   ; red
++
++    packssdw xmm1, xmm4        ; xmm1 = 8 blues
++    packssdw xmm2, xmm5        ; xmm2 = 8 greens
++    packssdw xmm3, xmm6        ; xmm3 = 8 reds
++
++    ; _Y = (( 54 * _R + 183 * _G +  18 * _B) >> 8);
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw18)]
++    pmullw xmm5, [lsym(cw183)]
++    pmullw xmm6, [lsym(cw54)]
++    paddw xmm4, xmm5
++    paddw xmm4, xmm6
++    psrlw xmm4, 8
++    packuswb xmm4, xmm7
++    movq [rdi], xmm4           ; out 8 bytes yyyyyyyy
++
++    ; _U = ((-29 * _R -  99 * _G + 128 * _B) >> 8) + 128;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw99)]
++    pmullw xmm6, [lsym(cw29)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LU1, xmm4             ; save for later
++
++    ; _V = ((128 * _R - 116 * _G -  12 * _B) >> 8) + 128;
++    movdqa xmm6, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm4, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw116)]
++    pmullw xmm6, [lsym(cw12)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LV1, xmm4             ; save for later
++
++    ; go down to second line
++    add rsi, LSRC_STRIDE
++    add rdi, LDST_Y_STRIDE
++
++    ; second line
++    movdqu xmm0, [rsi]         ; 4 pixels, 16 bytes
++    movdqa xmm1, xmm0          ; blue
++    pand xmm1, [lsym(cd255)]   ; blue
++    movdqa xmm2, xmm0          ; green
++    psrld xmm2, 8              ; green
++    pand xmm2, [lsym(cd255)]   ; green
++    movdqa xmm3, xmm0          ; red
++    psrld xmm3, 16             ; red
++    pand xmm3, [lsym(cd255)]   ; red
++
++    movdqu xmm0, [rsi + 16]    ; 4 pixels, 16 bytes
++    movdqa xmm4, xmm0          ; blue
++    pand xmm4, [lsym(cd255)]   ; blue
++    movdqa xmm5, xmm0          ; green
++    psrld xmm5, 8              ; green
++    pand xmm5, [lsym(cd255)]   ; green
++    movdqa xmm6, xmm0          ; red
++    psrld xmm6, 16             ; red
++    pand xmm6, [lsym(cd255)]   ; red
++
++    packssdw xmm1, xmm4        ; xmm1 = 8 blues
++    packssdw xmm2, xmm5        ; xmm2 = 8 greens
++    packssdw xmm3, xmm6        ; xmm3 = 8 reds
++
++    ; _Y = (( 54 * _R + 183 * _G +  18 * _B) >> 8);
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw18)]
++    pmullw xmm5, [lsym(cw183)]
++    pmullw xmm6, [lsym(cw54)]
++    paddw xmm4, xmm5
++    paddw xmm4, xmm6
++    psrlw xmm4, 8
++    packuswb xmm4, xmm7
++    movq [rdi], xmm4           ; out 8 bytes yyyyyyyy
++
++    ; _U = ((-29 * _R -  99 * _G + 128 * _B) >> 8) + 128;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw99)]
++    pmullw xmm6, [lsym(cw29)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LU2, xmm4             ; save for later
++
++    ; _V = ((128 * _R - 116 * _G -  12 * _B) >> 8) + 128;
++    movdqa xmm6, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm4, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw116)]
++    pmullw xmm6, [lsym(cw12)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LV2, xmm4             ; save for later
++
++    ; uv add and divide(average)
++    movq mm1, LU1              ; u from first line
++    movq mm3, mm1
++    pand mm1, [lsym(cw255)]
++    psrlw mm3, 8
++    pand mm3, [lsym(cw255)]
++    paddw mm1, mm3             ; add
++    movq mm2, LU2              ; u from second line
++    movq mm3, mm2
++    pand mm2, [lsym(cw255)]
++    paddw mm1, mm2             ; add
++    psrlw mm3, 8
++    pand mm3, [lsym(cw255)]
++    paddw mm1, mm3             ; add
++    paddw mm1, [lsym(cw2)]     ; add 2
++    psrlw mm1, 2               ; div 4
++
++    movq mm2, LV1              ; v from first line
++    movq mm4, mm2
++    pand mm2, [lsym(cw255)]
++    psrlw mm4, 8
++    pand mm4, [lsym(cw255)]
++    paddw mm2, mm4             ; add
++    movq mm3, LV2              ; v from second line
++    movq mm4, mm3
++    pand mm3, [lsym(cw255)]
++    paddw mm2, mm3             ; add
++    psrlw mm4, 8
++    pand mm4, [lsym(cw255)]
++    paddw mm2, mm4             ; add
++    paddw mm2, [lsym(cw2)]     ; add 2
++    psrlw mm2, 2               ; div 4
++
++    packuswb mm1, mm1
++    packuswb mm2, mm2
++
++    punpcklbw mm1, mm2         ; uv
++    movq [rdx], mm1            ; out 8 bytes uvuvuvuv
++
++    ; go up to first line
++    sub rsi, LSRC_STRIDE
++    sub rdi, LDST_Y_STRIDE
++
++    ; move right
++    lea rsi, [rsi + 32]
++    lea rdi, [rdi + 8]
++    lea rdx, [rdx + 8]
++
++    dec ecx
++    jnz loop1
++
++    ; update s8
++    mov rax, LS8               ; s8
++    add rax, LSRC_STRIDE       ; s8 += src_stride
++    add rax, LSRC_STRIDE       ; s8 += src_stride
++    mov LS8, rax
++
++    ; update d8_y
++    mov rax, LD8_Y             ; d8_y
++    add rax, LDST_Y_STRIDE     ; d8_y += dst_stride_y
++    add rax, LDST_Y_STRIDE     ; d8_y += dst_stride_y
++    mov LD8_Y, rax
++
++    ; update d8_uv
++    mov rax, LD8_UV            ; d8_uv
++    add rax, LDST_UV_STRIDE    ; d8_uv += dst_stride_uv
++    mov LD8_UV, rax
++
++    dec ebx
++    jnz row_loop1
++
++    mov rax, 0                 ; return value
++    add rsp, 80                ; local vars, 80 bytes
++    pop rbp
++    pop rbx
++    ret
++END_OF_FILE
+diff --git a/module/amd64/funcs_amd64.h b/module/amd64/funcs_amd64.h
+index ae38c53b..0af2fe8a 100644
+--- a/module/amd64/funcs_amd64.h
++++ b/module/amd64/funcs_amd64.h
+@@ -43,6 +43,11 @@ a8r8g8b8_to_nv12_box_amd64_sse2(const uint8_t *s8, int src_stride,
+                                 uint8_t *d8_y, int dst_stride_y,
+                                 uint8_t *d8_uv, int dst_stride_uv,
+                                 int width, int height);
++int
++a8r8g8b8_to_nv12_709fr_box_amd64_sse2(const uint8_t *s8, int src_stride,
++                                      uint8_t *d8_y, int dst_stride_y,
++                                      uint8_t *d8_uv, int dst_stride_uv,
++                                      int width, int height);
+ 
+ #endif
+ 
+diff --git a/module/rdp.h b/module/rdp.h
+index d10d6a3a..917457ec 100644
+--- a/module/rdp.h
++++ b/module/rdp.h
+@@ -82,6 +82,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ /* XRDP_nv12 */
+ #define XRDP_i420 \
+ ((12 << 24) | (65 << 16) | (0 << 12) | (0 << 8) | (0 << 4) | 0)
++/* XRDP_nv12_709fr */
++#define XRDP_nv12_709fr \
++((12 << 24) | (66 << 16) | (0 << 12) | (0 << 8) | (0 << 4) | 0)
++/* XRDP_yuv444_709fr */
++#define XRDP_yuv444_709fr \
++((32 << 24) | (67 << 16) | (0 << 12) | (0 << 8) | (0 << 4) | 0)
+ 
+ #define PixelToMM(_size, _dpi) (((_size) * 254 + (_dpi) * 5) / ((_dpi) * 10))
+ 
+@@ -91,6 +97,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+     ((_val) < (_lo) ? (_lo) : (_val) > (_hi) ? (_hi) : (_val))
+ #define RDPALIGN(_val, _al) ((((uintptr_t)(_val)) + ((_al) - 1)) & ~((_al) - 1))
+ 
++#define XRDP_RFX_ALIGN 64
++#define XRDP_H264_ALIGN 16
++
+ #define XRDP_CD_NODRAW 0
+ #define XRDP_CD_NOCLIP 1
+ #define XRDP_CD_CLIP   2
+@@ -122,6 +131,7 @@ struct image_data
+     int bpp;
+     int Bpp;
+     int lineBytes;
++    int flags;
+     uint8_t *pixels;
+     uint8_t *shmem_pixels;
+     int shmem_id;
+@@ -313,6 +323,7 @@ struct _rdpRec
+ 
+     copy_box_proc a8r8g8b8_to_a8b8g8r8_box;
+     copy_box_dst2_proc a8r8g8b8_to_nv12_box;
++    copy_box_dst2_proc a8r8g8b8_to_nv12_709fr_box;
+ 
+     /* multimon */
+     struct monitor_info minfo[16]; /* client monitor data */
+@@ -320,6 +331,7 @@ struct _rdpRec
+     int monitorCount;
+     /* glamor */
+     Bool glamor;
++    Bool nvidia;
+     PixmapPtr screenSwPixmap;
+     void *xvPutImage;
+     /* dri */
+@@ -330,7 +342,7 @@ struct _rdpRec
+ };
+ typedef struct _rdpRec rdpRec;
+ typedef struct _rdpRec * rdpPtr;
+-#define XRDPPTR(_p) ((rdpPtr)((_p)->driverPrivate))
++#define XRDPPTR(_p) ((rdpPtr)((_p)->reservedPtr[0]))
+ 
+ struct _rdpGCRec
+ {
+diff --git a/module/rdpCapture.c b/module/rdpCapture.c
+index 49edfb78..7d112efe 100644
+--- a/module/rdpCapture.c
++++ b/module/rdpCapture.c
+@@ -29,6 +29,7 @@ capture
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <limits.h>
+ 
+ /* this should be before all X11 .h files */
+ #include <xorg-server.h>
+@@ -45,6 +46,10 @@ capture
+ #include "rdpMisc.h"
+ #include "rdpCapture.h"
+ 
++#include "wyhash.h"
++/* hex digits of pi as a 64 bit int */
++#define WYHASH_SEED 0x3243f6a8885a308dull
++
+ #if defined(XORGXRDP_GLAMOR)
+ #include "rdpEgl.h"
+ #include <glamor.h>
+@@ -54,6 +59,11 @@ capture
+ #define LLOGLN(_level, _args) \
+     do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
+ 
++#define RGB_SPLIT(R, G, B, pixel) \
++    R = (pixel >> 16) & UCHAR_MAX; \
++    G = (pixel >>  8) & UCHAR_MAX; \
++    B = (pixel >>  0) & UCHAR_MAX;
++
+ /******************************************************************************/
+ /* copy rects with no error checking */
+ static int
+@@ -162,18 +172,18 @@ rdpCopyBox_a8r8g8b8_to_yuvalp(int ax, int ay,
+             while (kndex < width)
+             {
+                 pixel = *(s32++);
+-                a = (pixel >> 24) & 0xff;
+-                r = (pixel >> 16) & 0xff;
+-                g = (pixel >>  8) & 0xff;
+-                b = (pixel >>  0) & 0xff;
++                a = (pixel >> 24) & UCHAR_MAX;
++                r = (pixel >> 16) & UCHAR_MAX;
++                g = (pixel >>  8) & UCHAR_MAX;
++                b = (pixel >>  0) & UCHAR_MAX;
+                 y = (r *  19595 + g *  38470 + b *   7471) >> 16;
+                 u = (r * -11071 + g * -21736 + b *  32807) >> 16;
+                 v = (r *  32756 + g * -27429 + b *  -5327) >> 16;
+                 u = u + 128;
+                 v = v + 128;
+-                y = RDPCLAMP(y, 0, 255);
+-                u = RDPCLAMP(u, 0, 255);
+-                v = RDPCLAMP(v, 0, 255);
++                y = RDPCLAMP(y, 0, UCHAR_MAX);
++                u = RDPCLAMP(u, 0, UCHAR_MAX);
++                v = RDPCLAMP(v, 0, UCHAR_MAX);
+                 *(yptr++) = y;
+                 *(uptr++) = u;
+                 *(vptr++) = v;
+@@ -473,55 +483,47 @@ a8r8g8b8_to_nv12_box(const uint8_t *s8, int src_stride,
+ 
+             pixel = s32a[0];
+             s32a++;
+-            R = (pixel >> 16) & 0xff;
+-            G = (pixel >>  8) & 0xff;
+-            B = (pixel >>  0) & 0xff;
++            RGB_SPLIT(R, G, B, pixel);
+             Y = (( 66 * R + 129 * G +  25 * B + 128) >> 8) +  16;
+             U = ((-38 * R -  74 * G + 112 * B + 128) >> 8) + 128;
+             V = ((112 * R -  94 * G -  18 * B + 128) >> 8) + 128;
+-            d8ya[0] = RDPCLAMP(Y, 0, 255);
++            d8ya[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
+             d8ya++;
+-            U_sum += RDPCLAMP(U, 0, 255);
+-            V_sum += RDPCLAMP(V, 0, 255);
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
+ 
+             pixel = s32a[0];
+             s32a++;
+-            R = (pixel >> 16) & 0xff;
+-            G = (pixel >>  8) & 0xff;
+-            B = (pixel >>  0) & 0xff;
++            RGB_SPLIT(R, G, B, pixel);
+             Y = (( 66 * R + 129 * G +  25 * B + 128) >> 8) +  16;
+             U = ((-38 * R -  74 * G + 112 * B + 128) >> 8) + 128;
+             V = ((112 * R -  94 * G -  18 * B + 128) >> 8) + 128;
+-            d8ya[0] = RDPCLAMP(Y, 0, 255);
++            d8ya[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
+             d8ya++;
+-            U_sum += RDPCLAMP(U, 0, 255);
+-            V_sum += RDPCLAMP(V, 0, 255);
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
+ 
+             pixel = s32b[0];
+             s32b++;
+-            R = (pixel >> 16) & 0xff;
+-            G = (pixel >>  8) & 0xff;
+-            B = (pixel >>  0) & 0xff;
++            RGB_SPLIT(R, G, B, pixel);
+             Y = (( 66 * R + 129 * G +  25 * B + 128) >> 8) +  16;
+             U = ((-38 * R -  74 * G + 112 * B + 128) >> 8) + 128;
+             V = ((112 * R -  94 * G -  18 * B + 128) >> 8) + 128;
+-            d8yb[0] = RDPCLAMP(Y, 0, 255);
++            d8yb[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
+             d8yb++;
+-            U_sum += RDPCLAMP(U, 0, 255);
+-            V_sum += RDPCLAMP(V, 0, 255);
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
+ 
+             pixel = s32b[0];
+             s32b++;
+-            R = (pixel >> 16) & 0xff;
+-            G = (pixel >>  8) & 0xff;
+-            B = (pixel >>  0) & 0xff;
++            RGB_SPLIT(R, G, B, pixel);
+             Y = (( 66 * R + 129 * G +  25 * B + 128) >> 8) +  16;
+             U = ((-38 * R -  74 * G + 112 * B + 128) >> 8) + 128;
+             V = ((112 * R -  94 * G -  18 * B + 128) >> 8) + 128;
+-            d8yb[0] = RDPCLAMP(Y, 0, 255);
++            d8yb[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
+             d8yb++;
+-            U_sum += RDPCLAMP(U, 0, 255);
+-            V_sum += RDPCLAMP(V, 0, 255);
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
+ 
+             d8uv[0] = (U_sum + 2) / 4;
+             d8uv++;
+@@ -532,11 +534,138 @@ a8r8g8b8_to_nv12_box(const uint8_t *s8, int src_stride,
+     return 0;
+ }
+ 
++/******************************************************************************/
++int
++a8r8g8b8_to_nv12_709fr_box(const uint8_t *s8, int src_stride,
++                           uint8_t *d8_y, int dst_stride_y,
++                           uint8_t *d8_uv, int dst_stride_uv,
++                           int width, int height)
++{
++    int index;
++    int jndex;
++    int R;
++    int G;
++    int B;
++    int Y;
++    int U;
++    int V;
++    int U_sum;
++    int V_sum;
++    int pixel;
++    const uint32_t *s32a;
++    const uint32_t *s32b;
++    uint8_t *d8ya;
++    uint8_t *d8yb;
++    uint8_t *d8uv;
++
++    for (jndex = 0; jndex < height; jndex += 2)
++    {
++        s32a = (const uint32_t *) (s8 + src_stride * jndex);
++        s32b = (const uint32_t *) (s8 + src_stride * (jndex + 1));
++        d8ya = d8_y + dst_stride_y * jndex;
++        d8yb = d8_y + dst_stride_y * (jndex + 1);
++        d8uv = d8_uv + dst_stride_uv * (jndex / 2);
++        for (index = 0; index < width; index += 2)
++        {
++            U_sum = 0;
++            V_sum = 0;
++
++            pixel = s32a[0];
++            s32a++;
++            RGB_SPLIT(R, G, B, pixel);
++            Y =  ( 54 * R + 183 * G +  18 * B) >> 8;
++            U = ((-29 * R -  99 * G + 128 * B) >> 8) + 128;
++            V = ((128 * R - 116 * G -  12 * B) >> 8) + 128;
++            d8ya[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
++            d8ya++;
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
++
++            pixel = s32a[0];
++            s32a++;
++            RGB_SPLIT(R, G, B, pixel);
++            Y =  ( 54 * R + 183 * G +  18 * B) >> 8;
++            U = ((-29 * R -  99 * G + 128 * B) >> 8) + 128;
++            V = ((128 * R - 116 * G -  12 * B) >> 8) + 128;
++            d8ya[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
++            d8ya++;
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
++
++            pixel = s32b[0];
++            s32b++;
++            RGB_SPLIT(R, G, B, pixel);
++            Y =  ( 54 * R + 183 * G +  18 * B) >> 8;
++            U = ((-29 * R -  99 * G + 128 * B) >> 8) + 128;
++            V = ((128 * R - 116 * G -  12 * B) >> 8) + 128;
++            d8yb[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
++            d8yb++;
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
++
++            pixel = s32b[0];
++            s32b++;
++            RGB_SPLIT(R, G, B, pixel);
++            Y =  ( 54 * R + 183 * G +  18 * B) >> 8;
++            U = ((-29 * R -  99 * G + 128 * B) >> 8) + 128;
++            V = ((128 * R - 116 * G -  12 * B) >> 8) + 128;
++            d8yb[0] = RDPCLAMP(Y, 0, UCHAR_MAX);
++            d8yb++;
++            U_sum += RDPCLAMP(U, 0, UCHAR_MAX);
++            V_sum += RDPCLAMP(V, 0, UCHAR_MAX);
++
++            d8uv[0] = (U_sum + 2) / 4;
++            d8uv++;
++            d8uv[0] = (V_sum + 2) / 4;
++            d8uv++;
++        }
++    }
++    return 0;
++}
++
++/******************************************************************************/
++int
++a8r8g8b8_to_yuv444_709fr_box(const uint8_t *s8, int src_stride,
++                             uint8_t *d8, int dst_stride,
++                             int width, int height)
++{
++    int index;
++    int jndex;
++    int R, G, B;
++    int Y, U, V;
++    int cY, cU, cV;
++    int pixel;
++    const uint32_t *s32;
++    uint32_t *d32;
++
++    for (jndex = 0; jndex < height; jndex++)
++    {
++        s32 = (const uint32_t *) (s8 + src_stride * jndex);
++        d32 = (uint32_t *) (d8 + dst_stride * jndex);
++        for (index = 0; index < width; index++)
++        {
++            pixel = s32[0];
++            s32++;
++            RGB_SPLIT(R, G, B, pixel);
++            Y =  ( 54 * R + 183 * G +  18 * B) >> 8;
++            U = ((-29 * R -  99 * G + 128 * B) >> 8) + 128;
++            V = ((128 * R - 116 * G -  12 * B) >> 8) + 128;
++            cY = RDPCLAMP(Y, 0, UCHAR_MAX) << 16;
++            cU = RDPCLAMP(U, 0, UCHAR_MAX) << 8;
++            cV = RDPCLAMP(V, 0, UCHAR_MAX);
++            d32[0] = cY | cU | cV;
++            d32++;
++        }
++    }
++    return 0;
++}
++
+ /******************************************************************************/
+ /* copy rects with no error checking */
+ static int
+ rdpCopyBox_a8r8g8b8_to_nv12(rdpClientCon *clientCon,
+-                            const uint8_t *src, int src_stride, int srcx, int srcy,
++                            const uint8_t *src, int src_stride,
++                            int srcx, int srcy,
+                             uint8_t *dst_y, int dst_stride_y,
+                             uint8_t *dst_uv, int dst_stride_uv,
+                             int dstx, int dsty,
+@@ -569,6 +698,169 @@ rdpCopyBox_a8r8g8b8_to_nv12(rdpClientCon *clientCon,
+     return 0;
+ }
+ 
++/******************************************************************************/
++static void
++wyhash_rfx_tile_rows(const uint8_t *src, int src_stride, int x, int y,
++    uint64_t *row_hashes, int nrows)
++{
++    int row;
++    const uint8_t *s8;
++
++    for(row = 0; row < nrows; row++)
++    {
++        s8 = src + (y+row) * src_stride + x * 4;
++        row_hashes[row] = wyhash((const void*)s8, 64 * 4, WYHASH_SEED, _wyp);
++    }
++}
++
++/******************************************************************************/
++static uint64_t
++wyhash_rfx_tile_from_rows(const uint64_t *tile_rows, int tile_row_stride, 
++                          int x, int y)
++{
++    const uint64_t *row_hashes;
++    row_hashes = tile_rows + (x / 64) * tile_row_stride + y;
++    return wyhash((const void*)row_hashes, 64*sizeof(uint64_t), WYHASH_SEED, _wyp);
++}
++
++/* copy rects with no error checking */
++static int
++rdpCopyBox_a8r8g8b8_to_nv12_709fr(rdpClientCon *clientCon,
++                                  const uint8_t *src, int src_stride,
++                                  int srcx, int srcy,
++                                  uint8_t *dst_y, int dst_stride_y,
++                                  uint8_t *dst_uv, int dst_stride_uv,
++                                  int dstx, int dsty,
++                                  BoxPtr rects, int num_rects)
++{
++    const uint8_t *s8;
++    uint8_t *d8_y;
++    uint8_t *d8_uv;
++    int index;
++    int width;
++    int height;
++    BoxPtr box;
++
++    for (index = 0; index < num_rects; index++)
++    {
++        box = rects + index;
++        s8 = src + (box->y1 - srcy) * src_stride;
++        s8 += (box->x1 - srcx) * 4;
++        d8_y = dst_y + (box->y1 - dsty) * dst_stride_y;
++        d8_y += (box->x1 - dstx) * 1;
++        d8_uv = dst_uv + ((box->y1 - dsty) / 2) * dst_stride_uv;
++        d8_uv += (box->x1 - dstx) * 1;
++        width = box->x2 - box->x1;
++        height = box->y2 - box->y1;
++        clientCon->dev->a8r8g8b8_to_nv12_709fr_box(s8, src_stride,
++                                                   d8_y, dst_stride_y,
++                                                   d8_uv, dst_stride_uv,
++                                                   width, height);
++    }
++    return 0;
++}
++
++/******************************************************************************/
++/* copy rects with no error checking */
++static int
++rdpCopyBox_a8r8g8b8_to_yuv444_709fr(rdpClientCon *clientCon,
++                                    const uint8_t *src, int src_stride,
++                                    int srcx, int srcy,
++                                    uint8_t *dst, int dst_stride,
++                                    int dstx, int dsty,
++                                    BoxPtr rects, int num_rects)
++{
++    const uint8_t *s8;
++    uint8_t *d8;
++    int index;
++    int width;
++    int height;
++    BoxPtr box;
++
++    for (index = 0; index < num_rects; index++)
++    {
++        box = rects + index;
++        s8 = src + (box->y1 - srcy) * src_stride;
++        s8 += (box->x1 - srcx) * 4;
++        d8 = dst + (box->y1 - dsty) * dst_stride;
++        d8 += (box->x1 - dstx) * 4;
++        width = box->x2 - box->x1;
++        height = box->y2 - box->y1;
++        a8r8g8b8_to_yuv444_709fr_box(s8, src_stride,
++                                     d8, dst_stride,
++                                     width, height);
++    }
++    return 0;
++}
++
++/******************************************************************************/
++static Bool
++rdpCopyBoxList(rdpClientCon *clientCon, PixmapPtr dstPixmap,
++               BoxPtr out_rects, int num_out_rects)
++{
++    PixmapPtr hwPixmap;
++    BoxPtr pbox;
++    ScreenPtr pScreen;
++    GCPtr copyGC;
++    ChangeGCVal tmpval[1];
++    int count;
++    int index;
++    int left;
++    int top;
++    int width;
++    int height;
++    char pix1[16];
++    rdpPtr dev;
++
++    LLOGLN(10, ("rdpCopyBoxList:"));
++
++    dev = clientCon->dev;
++    pScreen = dev->pScreen;
++    hwPixmap = pScreen->GetScreenPixmap(pScreen);
++    copyGC = GetScratchGC(dev->depth, pScreen);
++    if (copyGC == NULL)
++    {
++        return FALSE;
++    }
++    tmpval[0].val = GXcopy;
++    ChangeGC(NullClient, copyGC, GCFunction, tmpval);
++    ValidateGC(&(hwPixmap->drawable), copyGC);
++    count = num_out_rects;
++    pbox = out_rects;
++    for (index = 0; index < count; index++)
++    {
++        left = pbox[index].x1;
++        top = pbox[index].y1;
++        width = pbox[index].x2 - pbox[index].x1;
++        height = pbox[index].y2 - pbox[index].y1;
++        if ((width > 0) && (height > 0))
++        {
++            copyGC->ops->CopyArea(&(hwPixmap->drawable),
++                                    &(dstPixmap->drawable),
++                                    copyGC, left, top,
++                                    width, height, left, top);
++        }
++    }
++    FreeScratchGC(copyGC);
++    pScreen->GetImage(&(dstPixmap->drawable), 0, 0, 1, 1, ZPixmap,
++                          0xffffffff, pix1);
++
++    return TRUE;
++}
++
++/******************************************************************************/
++static Bool
++isShmStatusActive(enum shared_memory_status status) {
++    switch (status) {
++        case SHM_ACTIVE:
++        case SHM_RFX_ACTIVE:
++        case SHM_H264_ACTIVE:
++            return TRUE;
++        default:
++            return FALSE;
++    }
++}
++
+ /******************************************************************************/
+ static Bool
+ rdpCapture0(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+@@ -587,14 +879,13 @@ rdpCapture0(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+ 
+     LLOGLN(10, ("rdpCapture0:"));
+ 
+-    if (clientCon->shmemstatus == SHM_UNINITIALIZED || clientCon->shmemstatus == SHM_RESIZING) {
++    if (!isShmStatusActive(clientCon->shmemstatus)) {
+         LLOGLN(0, ("rdpCapture0: WARNING -- Shared memory is not configured. Aborting capture!"));
+         return FALSE;
+     }
+ 
+     rv = TRUE;
+ 
+-
+     num_rects = REGION_NUM_RECTS(in_reg);
+     psrc_rects = REGION_RECTS(in_reg);
+ 
+@@ -612,6 +903,16 @@ rdpCapture0(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+         (*out_rects)[i] = rect;
+     }
+ 
++    if (clientCon->dev->glamor || clientCon->dev->nvidia)
++    {
++        /* copy vmem to smem */
++        if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
++                            *out_rects, *num_out_rects))
++        {
++            return FALSE;
++        }
++    }
++
+     src = id->pixels;
+     dst = id->shmem_pixels;
+     dst_format = clientCon->rdp_format;
+@@ -697,7 +998,7 @@ rdpCapture1(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+ 
+     LLOGLN(10, ("rdpCapture1:"));
+ 
+-    if (clientCon->shmemstatus == SHM_UNINITIALIZED || clientCon->shmemstatus == SHM_RESIZING) {
++    if (!isShmStatusActive(clientCon->shmemstatus)) {
+         LLOGLN(0, ("rdpCapture1: WARNING -- Shared memory is not configured. Aborting capture!"));
+         return FALSE;
+     }
+@@ -758,6 +1059,16 @@ rdpCapture1(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+         index++;
+     }
+ 
++    if (clientCon->dev->glamor || clientCon->dev->nvidia)
++    {
++        /* copy vmem to smem */
++        if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
++                            *out_rects, *num_out_rects))
++        {
++            return FALSE;
++        }
++    }
++
+     src = id->pixels;
+     dst = id->shmem_pixels;
+     dst_format = clientCon->rdp_format;
+@@ -829,8 +1140,11 @@ rdpCapture2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+     int dst_stride;
+     int crc_offset;
+     int crc_stride;
+-    int crc;
++    uint64_t crc;
+     int num_crcs;
++    int num_skips;
++    int tile_row_stride, crc_height;
++    uint64_t *row_hashes;
+ 
+     LLOGLN(10, ("rdpCapture2:"));
+ 
+@@ -839,12 +1153,23 @@ rdpCapture2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+         return FALSE;
+     }
+ 
++    if (clientCon->dev->glamor || clientCon->dev->nvidia)
++    {
++        /* copy vmem to smem */
++        if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
++                            REGION_RECTS(in_reg), REGION_NUM_RECTS(in_reg)))
++        {
++            return FALSE;
++        }
++    }
++
+     *out_rects = g_new(BoxRec, RDP_MAX_TILES);
+     if (*out_rects == NULL)
+     {
+         return FALSE;
+     }
+     out_rect_index = 0;
++    extents_rect = *rdpRegionExtents(in_reg);
+ 
+     src = id->pixels;
+     dst = id->shmem_pixels;
+@@ -852,17 +1177,46 @@ rdpCapture2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+     dst_stride = clientCon->cap_stride_bytes;
+ 
+     crc_stride = (clientCon->dev->width + 63) / 64;
+-    num_crcs = crc_stride * ((clientCon->dev->height + 63) / 64);
++    /* tile rows are column-major */
++    tile_row_stride = ((clientCon->dev->height + 63) / 64) * 64;
++    crc_height = ((clientCon->dev->height + 63) / 64);
++    num_crcs = crc_stride * crc_height;
+     if (num_crcs != clientCon->num_rfx_crcs_alloc)
+     {
+-        /* resize the crc list */
++        /* resize the hash list */
+         clientCon->num_rfx_crcs_alloc = num_crcs;
+         free(clientCon->rfx_crcs);
+-        clientCon->rfx_crcs = g_new0(int, num_crcs);
++        free(clientCon->rfx_tile_row_hashes);
++        clientCon->rfx_crcs = g_new0(uint64_t, num_crcs);
++        clientCon->rfx_tile_row_hashes = g_new0(uint64_t, num_crcs * 64);
++    }
++
++    /* update the tile row hashes. Column major order to be kind to 
++       prefetchers even though it shouldn't matter much */
++    x = extents_rect.x1 & ~63;
++    while (x < extents_rect.x2)
++    {
++        y = extents_rect.y1 & ~63;
++        while (y < extents_rect.y2)
++        {
++            rect.x1 = x;
++            rect.y1 = y;
++            rect.x2 = rect.x1 + 64;
++            rect.y2 = rect.y1 + 64;
++            rcode = rdpRegionContainsRect(in_reg, &rect);
++            if (rcode == rgnIN)
++            {
++                row_hashes = clientCon->rfx_tile_row_hashes + 
++                    (x / 64) * tile_row_stride + y;
++                wyhash_rfx_tile_rows(src, src_stride, x, y, row_hashes, 64);
++            }
++            y += 64;
++        }
++        x += 64;
+     }
+ 
+-    extents_rect = *rdpRegionExtents(in_reg);
+     y = extents_rect.y1 & ~63;
++    num_skips = 0;
+     while (y < extents_rect.y2)
+     {
+         x = extents_rect.x1 & ~63;
+@@ -877,7 +1231,7 @@ rdpCapture2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+ 
+             if (rcode != rgnOUT)
+             {
+-                crc = crc_start();
++                /* hex digits of pi as a 64 bit int */
+                 if (rcode == rgnPART)
+                 {
+                     LLOGLN(10, ("rdpCapture2: rgnPART"));
+@@ -886,35 +1240,42 @@ rdpCapture2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+                     rdpRegionIntersect(&tile_reg, in_reg, &tile_reg);
+                     rects = REGION_RECTS(&tile_reg);
+                     num_rects = REGION_NUM_RECTS(&tile_reg);
+-                    crc = crc_process_data(crc, rects,
+-                                           num_rects * sizeof(BoxRec));
++                    crc = wyhash((const void*)rects, num_rects * sizeof(BoxRec), 
++                        crc, _wyp);
+                     rdpCopyBox_a8r8g8b8_to_yuvalp(x, y,
+                                                   src, src_stride,
+                                                   dst, dst_stride,
+                                                   rects, num_rects);
++                    crc_dst = dst + (y << 8) * (dst_stride >> 8) + (x << 8);
++                    crc = 0x3243f6a8885a308dull;
++                    crc = wyhash((const void*)crc_dst, 64 * 64 * 4, crc, _wyp);
+                     rdpRegionUninit(&tile_reg);
+                 }
+                 else /* rgnIN */
+                 {
+                     LLOGLN(10, ("rdpCapture2: rgnIN"));
+-                    rdpCopyBox_a8r8g8b8_to_yuvalp(x, y,
+-                                                  src, src_stride,
+-                                                  dst, dst_stride,
+-                                                  &rect, 1);
++                    crc = wyhash_rfx_tile_from_rows(
++                        clientCon->rfx_tile_row_hashes, tile_row_stride, x, y);
++
+                 }
+-                crc_dst = dst + (y << 8) * (dst_stride >> 8) + (x << 8);
+-                crc = crc_process_data(crc, crc_dst, 64 * 64 * 4);
+-                crc = crc_end(crc);
+                 crc_offset = (y / 64) * crc_stride + (x / 64);
+-                LLOGLN(10, ("rdpCapture2: crc 0x%8.8x 0x%8.8x",
+-                       crc, clientCon->rfx_crcs[crc_offset]));
+                 if (crc == clientCon->rfx_crcs[crc_offset])
+                 {
+-                    LLOGLN(10, ("rdpCapture2: crc skip at x %d y %d", x, y));
++                    LLOGLN(10, ("rdpCapture2: crc skip at x: %d, y: %d, "
++                                "skip count: %d", x, y, num_skips));
++                    num_skips += 1;
+                 }
+                 else
+                 {
+                     clientCon->rfx_crcs[crc_offset] = crc;
++                    /* lazily only do this if hash wasn't identical */
++                    if (rcode != rgnPART)
++                    {
++                        rdpCopyBox_a8r8g8b8_to_yuvalp(x, y,
++                                src, src_stride,
++                                dst, dst_stride,
++                                &rect, 1);
++                    }
+                     (*out_rects)[out_rect_index] = rect;
+                     out_rect_index++;
+                     if (out_rect_index >= RDP_MAX_TILES)
+@@ -942,7 +1303,9 @@ rdpCapture3(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+     BoxPtr psrc_rects;
+     BoxRec rect;
+     int num_rects;
+-    int index;
++    int num_out_rects_index;
++    int num_rects_index;
++    BoxPtr lout_rects;
+     uint8_t *dst_uv;
+     Bool rv;
+     const uint8_t *src;
+@@ -953,7 +1316,7 @@ rdpCapture3(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+ 
+     LLOGLN(10, ("rdpCapture3:"));
+ 
+-    if (clientCon->shmemstatus == SHM_UNINITIALIZED || clientCon->shmemstatus == SHM_RESIZING) {
++    if (!isShmStatusActive(clientCon->shmemstatus)) {
+         LLOGLN(0, ("rdpCapture3: WARNING -- Shared memory is not configured. Aborting capture!"));
+         return FALSE;
+     }
+@@ -968,23 +1331,56 @@ rdpCapture3(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+         return FALSE;
+     }
+ 
+-    *num_out_rects = num_rects;
+-
+-    *out_rects = g_new(BoxRec, num_rects * 4);
+-    index = 0;
+-    while (index < num_rects)
++    lout_rects = g_new(BoxRec, num_rects * 4);
++    num_out_rects_index = 0;
++    for (num_rects_index = 0; num_rects_index < num_rects; num_rects_index++)
+     {
+-        rect = psrc_rects[index];
+-        LLOGLN(10, ("old x1 %d y1 %d x2 %d y2 %d", rect.x1, rect.x2,
++        rect = psrc_rects[num_rects_index];
++        LLOGLN(10, ("old x1 %d y1 %d x2 %d y2 %d", rect.x1, rect.y1,
+                rect.x2, rect.y2));
+         rect.x1 -= rect.x1 & 1;
+         rect.y1 -= rect.y1 & 1;
+         rect.x2 += rect.x2 & 1;
+         rect.y2 += rect.y2 & 1;
+-        LLOGLN(10, ("new x1 %d y1 %d x2 %d y2 %d", rect.x1, rect.x2,
+-               rect.x2, rect.y2));
+-        (*out_rects)[index] = rect;
+-        index++;
++        /* todo: clip to monitor as well */
++        while (rect.x2 > clientCon->dev->width)
++        {
++            rect.x2 -= 2;
++        }
++        while (rect.y2 > clientCon->dev->height)
++        {
++            rect.y2 -= 2;
++        }
++        if ((rect.x2 > rect.x1) && (rect.y2 > rect.y1))
++        {
++            (lout_rects)[num_out_rects_index] = rect;
++            num_out_rects_index++;
++        }
++    }
++
++    num_rects = num_out_rects_index;
++    if (num_rects < 1)
++    {
++        free(lout_rects);
++        return FALSE;
++    }
++    *out_rects = lout_rects;
++    *num_out_rects = num_rects;
++
++    if (clientCon->helperPixmaps[0] != NULL)
++    {
++        /* copy vmem to vmem */
++        rv = rdpCopyBoxList(clientCon, clientCon->helperPixmaps[0],
++                            *out_rects, *num_out_rects);
++        id->flags |= ENCODE_COMPLETE;
++        return rv;
++        /* helper will do the rest */
++    }
++    else if (clientCon->dev->glamor || clientCon->dev->nvidia)
++    {
++        /* copy vmem to smem */
++        rv = rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
++                            *out_rects, *num_out_rects);
+     }
+ 
+     src = id->pixels;
+@@ -1000,6 +1396,25 @@ rdpCapture3(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+                                         dst, dst_stride, 0, 0,
+                                         *out_rects, num_rects);
+     }
++    else if (dst_format == XRDP_yuv444_709fr)
++    {
++        rdpCopyBox_a8r8g8b8_to_yuv444_709fr(clientCon,
++                                            src, src_stride, 0, 0,
++                                            dst, dst_stride,
++                                            0, 0,
++                                            *out_rects, num_rects);
++    }
++    else if (dst_format == XRDP_nv12_709fr)
++    {
++        dst_uv = dst;
++        dst_uv += clientCon->cap_width * clientCon->cap_height;
++        rdpCopyBox_a8r8g8b8_to_nv12_709fr(clientCon,
++                                          src, src_stride, 0, 0,
++                                          dst, dst_stride,
++                                          dst_uv, dst_stride,
++                                          0, 0,
++                                          *out_rects, num_rects);
++    }
+     else if (dst_format == XRDP_nv12)
+     {
+         dst_uv = dst;
+@@ -1019,65 +1434,6 @@ rdpCapture3(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+     return rv;
+ }
+ 
+-#if defined(XORGXRDP_GLAMOR)
+-/******************************************************************************/
+-static int
+-copy_vmem(rdpPtr dev, RegionPtr in_reg)
+-{
+-    PixmapPtr hwPixmap;
+-    PixmapPtr swPixmap;
+-    BoxPtr pbox;
+-    ScreenPtr pScreen;
+-    GCPtr copyGC;
+-    ChangeGCVal tmpval[1];
+-    int count;
+-    int index;
+-    int left;
+-    int top;
+-    int width;
+-    int height;
+-
+-    /* copy the dirty area from the screen hw pixmap to a sw pixmap
+-       this should do a dma */
+-    pScreen = dev->pScreen;
+-    hwPixmap = pScreen->GetScreenPixmap(pScreen);
+-    swPixmap = dev->screenSwPixmap;
+-    copyGC = GetScratchGC(dev->depth, pScreen);
+-    if (copyGC != NULL)
+-    {
+-        tmpval[0].val = GXcopy;
+-        ChangeGC(NullClient, copyGC, GCFunction, tmpval);
+-        ValidateGC(&(hwPixmap->drawable), copyGC);
+-        count = REGION_NUM_RECTS(in_reg);
+-        pbox = REGION_RECTS(in_reg);
+-        for (index = 0; index < count; index++)
+-        {
+-            left = pbox[index].x1;
+-            top = pbox[index].y1;
+-            width = pbox[index].x2 - pbox[index].x1;
+-            height = pbox[index].y2 - pbox[index].y1;
+-            if ((width > 0) && (height > 0))
+-            {
+-                LLOGLN(10, ("copy_vmem: hwPixmap tex 0x%8.8x "
+-                       "swPixmap tex 0x%8.8x",
+-                       glamor_get_pixmap_texture(hwPixmap),
+-                       glamor_get_pixmap_texture(swPixmap)));
+-                 copyGC->ops->CopyArea(&(hwPixmap->drawable),
+-                                       &(swPixmap->drawable),
+-                                       copyGC, left, top,
+-                                       width, height, left, top);
+-            }
+-        }
+-        FreeScratchGC(copyGC);
+-    }
+-    else
+-    {
+-        return 1;
+-    }
+-    return 0;
+-}
+-#endif
+-
+ /**
+  * Copy an array of rectangles from one memory area to another
+  *****************************************************************************/
+@@ -1089,17 +1445,6 @@ rdpCapture(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
+ 
+     LLOGLN(10, ("rdpCapture:"));
+     mode = clientCon->client_info.capture_code;
+-    if (clientCon->dev->glamor)
+-    {
+-#if defined(XORGXRDP_GLAMOR)
+-        if (mode == 2)
+-        {
+-            return rdpEglCaptureRfx(clientCon, in_reg, out_rects,
+-                                    num_out_rects, id);
+-        }
+-        copy_vmem(clientCon->dev, in_reg);
+-#endif
+-    }
+     switch (mode)
+     {
+         case 0:
+diff --git a/module/rdpCapture.h b/module/rdpCapture.h
+index 2696b009..97ae1d51 100644
+--- a/module/rdpCapture.h
++++ b/module/rdpCapture.h
+@@ -46,5 +46,10 @@ a8r8g8b8_to_nv12_box(const uint8_t *s8, int src_stride,
+                      uint8_t *d8_y, int dst_stride_y,
+                      uint8_t *d8_uv, int dst_stride_uv,
+                      int width, int height);
++extern _X_EXPORT int
++a8r8g8b8_to_nv12_709fr_box(const uint8_t *s8, int src_stride,
++                           uint8_t *d8_y, int dst_stride_y,
++                           uint8_t *d8_uv, int dst_stride_uv,
++                           int width, int height);
+ 
+ #endif
+diff --git a/module/rdpClientCon.c b/module/rdpClientCon.c
+index 25d2ec2a..d46c05f7 100644
+--- a/module/rdpClientCon.c
++++ b/module/rdpClientCon.c
+@@ -33,7 +33,8 @@ Client connection to xrdp
+ #include <sys/types.h>
+ #include <sys/ipc.h>
+ #include <sys/shm.h>
+-#include <limits.h>
++#include <sys/socket.h>
++#include <sys/wait.h>
+ 
+ /* this should be before all X11 .h files */
+ #include <xorg-server.h>
+@@ -50,7 +51,13 @@ Client connection to xrdp
+ #include "rdpInput.h"
+ #include "rdpReg.h"
+ #include "rdpCapture.h"
++#include <limits.h>
++
++#if defined(XORGXRDP_LRANDR)
++#include "rdpLRandR.h"
++#else
+ #include "rdpRandR.h"
++#endif
+ 
+ #define LOG_LEVEL 1
+ #define LLOGLN(_level, _args) \
+@@ -105,7 +112,7 @@ rdpClientConDisconnect(rdpPtr dev, rdpClientCon *clientCon);
+ static CARD32
+ rdpDeferredIdleDisconnectCallback(OsTimerPtr timer, CARD32 now, pointer arg);
+ static void
+-rdpScheduleDeferredUpdate(rdpClientCon *clientCon);
++rdpScheduleDeferredUpdate(rdpClientCon *clientCon, Bool can_call_now);
+ 
+ #if XORG_VERSION_CURRENT < XORG_VERSION_NUMERIC(1, 18, 5, 0, 0)
+ 
+@@ -272,6 +279,8 @@ rdpClientConGotConnection(ScreenPtr pScreen, rdpPtr dev)
+     clientCon->dirtyRegion = rdpRegionCreate(NullBox, 0);
+     clientCon->shmRegion = rdpRegionCreate(NullBox, 0);
+ 
++    rdpClientConAddDirtyScreen(dev, clientCon, 0, 0, clientCon->rdp_width, clientCon->rdp_height);
++
+     return 0;
+ }
+ 
+@@ -354,6 +363,59 @@ rdpDeferredIdleDisconnectCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+                                         rdpDeferredIdleDisconnectCallback, dev);
+     return 0;
+ }
++
++/*****************************************************************************/
++static int
++rdpShutdownHelper(rdpPtr dev, rdpClientCon *clientCon) {
++    ScreenPtr pScreen;
++    PixmapPtr pPixmap;
++    int index;
++
++    LLOGLN(0, ("rdpShutdownHelper:"));
++    if (clientCon->helper_pid <= 0)
++    {
++        return 0;
++    }
++    int exit_code;
++    if (waitpid(clientCon->helper_pid, &exit_code, WNOHANG) == 0)
++    {
++        /* still running */
++        kill(clientCon->helper_pid, SIGTERM);
++        waitpid(clientCon->helper_pid, &exit_code, 0);
++    }
++    pScreen = clientCon->dev->pScreen;
++    for (index = 0; index < 16; index++)
++    {
++        pPixmap = clientCon->helperPixmaps[index];
++        if (pPixmap != NULL)
++        {
++            pScreen->DestroyPixmap(pPixmap);
++        }
++    }
++    clientCon->helper_pid = -1;
++    return exit_code;
++}
++
++/******************************************************************************/
++static int
++rdpClientConUseHelper(rdpPtr dev, rdpClientCon *clientCon) {
++    const char *xrdp_use_helper = getenv("XRDP_USE_HELPER");
++    if (xrdp_use_helper == NULL)
++    {
++        return 0;
++    }
++    if (strcmp(xrdp_use_helper, "0") == 0)
++    {
++        return 0;
++    }
++    if (strcmp(xrdp_use_helper, "1") == 0)
++    {
++        return ((dev->nvidia || dev->glamor) &&
++                (clientCon->client_info.capture_code == 3));
++    }
++    return 0;
++}
++
+ /*****************************************************************************/
+ static int
+ rdpClientConDisconnect(rdpPtr dev, rdpClientCon *clientCon)
+@@ -415,6 +477,9 @@ rdpClientConDisconnect(rdpPtr dev, rdpClientCon *clientCon)
+     {
+         shmdt(clientCon->shmemptr);
+     }
++    if (rdpClientConUseHelper(dev, clientCon)) {
++        rdpShutdownHelper(dev, clientCon);
++    }
+     free(clientCon);
+     return 0;
+ }
+@@ -425,6 +490,7 @@ static int
+ rdpClientConSend(rdpPtr dev, rdpClientCon *clientCon, const char *data, int len)
+ {
+     int sent;
++    int retries = 0;
+ 
+     LLOGLN(10, ("rdpClientConSend - sending %d bytes", len));
+ 
+@@ -441,6 +507,12 @@ rdpClientConSend(rdpPtr dev, rdpClientCon *clientCon, const char *data, int len)
+         {
+             if (g_sck_last_error_would_block(clientCon->sck))
+             {
++                // Just because we couldn't after 100 retries
++                // does not mean we're disconnected.
++                if (retries > 100) {
++                    return 0;
++                }
++                ++retries;
+                 g_sleep(1);
+             }
+             else
+@@ -706,6 +778,7 @@ rdpClientConAllocateSharedMemory(rdpClientCon *clientCon, int bytes)
+            clientCon->shmemid, clientCon->shmemptr,
+            clientCon->shmem_bytes));
+ }
++
+ /******************************************************************************/
+ /*
+     this from miScreenInit
+@@ -775,16 +848,40 @@ rdpClientConProcessScreenSizeMsg(rdpPtr dev, rdpClientCon *clientCon,
+ 
+     if ((dev->width != width) || (dev->height != height))
+     {
++#if defined(XORGXRDP_LRANDR)
++        /* even though we are not using the built in randr, we still need
++         * to call this so driver can setup */
++        ok = RRScreenSizeSet(dev->pScreen, width, height, mmwidth, mmheight);
++        LLOGLN(0, ("rdpClientConProcessScreenSizeMsg: RRScreenSizeSet ok=[%d]", ok));
++        ok = rdpLRRScreenSizeSet(dev, width, height, mmwidth, mmheight);
++        LLOGLN(0, ("rdpClientConProcessScreenSizeMsg: LRRScreenSizeSet ok=[%d]", ok));
++#else
+         dev->allow_screen_resize = 1;
+         ok = RRScreenSizeSet(dev->pScreen, width, height, mmwidth, mmheight);
+         dev->allow_screen_resize = 0;
+         LLOGLN(0, ("rdpClientConProcessScreenSizeMsg: RRScreenSizeSet ok=[%d]", ok));
+         RRTellChanged(dev->pScreen);
++#endif
+     }
+ 
+     return 0;
+ }
+ 
++/******************************************************************************/
++static enum shared_memory_status
++convertSharedMemoryStatusToActive(enum shared_memory_status status) {
++    switch (status) {
++        case SHM_ACTIVE_PENDING:
++            return SHM_ACTIVE;
++        case SHM_RFX_ACTIVE_PENDING:
++            return SHM_RFX_ACTIVE;
++        case SHM_H264_ACTIVE_PENDING:
++            return SHM_H264_ACTIVE;
++        default:
++            return status;
++    }
++}
++
+ /******************************************************************************/
+ static int
+ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
+@@ -824,8 +921,12 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
+         y = param1 & 0xffff;
+         cx = (param2 >> 16) & 0xffff;
+         cy = param2 & 0xffff;
++        clientCon->rect_id = 0;
++        //clientCon->rect_id_ack = INT_MAX;
++        clientCon->rect_id_ack = 0;
+         LLOGLN(0, ("rdpClientConProcessMsgClientInput: invalidate x %d y %d "
+                "cx %d cy %d", x, y, cx, cy));
++        clientCon->shmemstatus = convertSharedMemoryStatusToActive(clientCon->shmemstatus);
+         rdpClientConAddDirtyScreen(dev, clientCon, x, y, cx, cy);
+     }
+     else if (msg == 300) /* resize desktop */
+@@ -846,6 +947,170 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
+     return 0;
+ }
+ 
++/******************************************************************************/
++static int
++rdpStartHelper(rdpPtr dev, rdpClientCon *clientCon)
++{
++    char text[64];
++    int spair[2];
++    int index;
++
++    // The helper is already running, don't attempt to initialize it again.
++    if (clientCon->helper_pid > 0) {
++        return 0;
++    }
++
++    socketpair(AF_UNIX, SOCK_STREAM, 0, spair);
++
++    clientCon->helper_pid = fork();
++    if (clientCon->helper_pid == -1)
++    {
++        /* error */
++        close(spair[0]);
++        close(spair[1]);
++    }
++        else if (clientCon->helper_pid == 0)
++    {
++        /* child */
++        for (index = 0; index < 256; index++)
++        {
++            if ((index != clientCon->sck) && (index != spair[0]))
++            {
++                close(index);
++            }
++        }
++        open("/dev/null", O_RDWR);
++        open("/dev/null", O_RDWR);
++        open("/dev/null", O_RDWR);
++        snprintf(text, 63, ":%s", display);
++        text[63] = 0;
++        setenv("DISPLAY", text, 1);
++        snprintf(text, 63, "%d", spair[0]);
++        text[63] = 0;
++        setenv("XORGXRDP_XORG_FD", text, 1);
++        snprintf(text, 63, "%d", clientCon->sck);
++        text[63] = 0;
++        setenv("XORGXRDP_XRDP_FD", text, 1);
++        execlp("xorgxrdp_helper", "xorgxrdp_helper", "-d", (void *) 0);
++        exit(0);
++    }
++    else
++    {
++        /* parent */
++        LLOGLN(0, ("rdpClientConProcessMsgClientInfo: started helper pid %d",
++               clientCon->helper_pid));
++        rdpClientConRemoveEnabledDevice(clientCon->sck);
++        close(clientCon->sck);
++        close(spair[0]);
++        clientCon->sck = spair[1];
++        g_sck_set_non_blocking(clientCon->sck);
++        rdpClientConAddEnabledDevice(dev->pScreen, clientCon->sck);
++    }
++    return 0;
++}
++
++/******************************************************************************/
++static int
++rdpSendHelperMonitors(rdpPtr dev, rdpClientCon *clientCon)
++{
++    int index;
++    int len;
++    int rv;
++    int width;
++    int height;
++    const int layer_size = 8;
++
++    rdpClientConSendPending(dev, clientCon);
++    init_stream(clientCon->out_s, 0);
++    s_push_layer(clientCon->out_s, iso_hdr, layer_size);
++    out_uint16_le(clientCon->out_s, 1); /* clear monitors */
++    out_uint16_le(clientCon->out_s, 4); /* size */
++    clientCon->count++;
++    if (dev->monitorCount < 1)
++    {
++        width = RDPALIGN(dev->width, XRDP_H264_ALIGN);
++        height = RDPALIGN(dev->height, XRDP_H264_ALIGN);
++        out_uint16_le(clientCon->out_s, 2);
++        out_uint16_le(clientCon->out_s, 20); /* size */
++        out_uint16_le(clientCon->out_s, width);
++        out_uint16_le(clientCon->out_s, height);
++        out_uint32_le(clientCon->out_s, 0xDEADBEEF);
++        out_uint32_le(clientCon->out_s, clientCon->conNumber);
++        out_uint32_le(clientCon->out_s, 0);
++        clientCon->count++;
++    }
++    else
++    {
++        for (index = 0; index < dev->monitorCount; index++)
++        {
++            width = RDPALIGN(dev->minfo[index].right - dev->minfo[index].left, XRDP_H264_ALIGN);
++            height = RDPALIGN(dev->minfo[index].bottom - dev->minfo[index].top, XRDP_H264_ALIGN);
++            out_uint16_le(clientCon->out_s, 2);
++            out_uint16_le(clientCon->out_s, 20); /* size */
++            out_uint16_le(clientCon->out_s, width);
++            out_uint16_le(clientCon->out_s, height);
++            out_uint32_le(clientCon->out_s, 0xDEADBEEF);
++            out_uint32_le(clientCon->out_s, clientCon->conNumber);
++            out_uint32_le(clientCon->out_s, index);
++            clientCon->count++;
++        }
++    }
++    s_mark_end(clientCon->out_s);
++    len = (int) (clientCon->out_s->end - clientCon->out_s->data);
++    s_pop_layer(clientCon->out_s, iso_hdr);
++    out_uint16_le(clientCon->out_s, 100);
++    out_uint16_le(clientCon->out_s, clientCon->count);
++    out_uint32_le(clientCon->out_s, len - layer_size);
++    rv = rdpClientConSend(dev, clientCon, clientCon->out_s->data, len);
++    return rv;
++}
++
++/******************************************************************************/
++static int
++rdpSendMemoryAllocationComplete(rdpPtr dev, rdpClientCon *clientCon)
++{
++    int len;
++    int rv;
++    int width = dev->width;
++    int height = dev->height;
++    int alignment = 0;
++    const int layer_size = 8;
++
++    switch (clientCon->client_info.capture_code)
++    {
++        case 2:
++            alignment = XRDP_RFX_ALIGN;
++            break;
++        case 3:
++            alignment = XRDP_H264_ALIGN;
++            break;
++        default:
++            break;
++    }
++    if (alignment != 0)
++    {
++        width = RDPALIGN(dev->width, alignment);
++        height = RDPALIGN(dev->height, alignment);
++    }
++
++    rdpClientConSendPending(dev, clientCon);
++    init_stream(clientCon->out_s, 0);
++    s_push_layer(clientCon->out_s, iso_hdr, layer_size);
++    clientCon->count++;
++    out_uint16_le(clientCon->out_s, 3); /* code: memory allocation complete */
++    out_uint16_le(clientCon->out_s, 8); /* size */
++    out_uint16_le(clientCon->out_s, width);
++    out_uint16_le(clientCon->out_s, height);
++    s_mark_end(clientCon->out_s);
++    len = (int) (clientCon->out_s->end - clientCon->out_s->data);
++    s_pop_layer(clientCon->out_s, iso_hdr);
++    out_uint16_le(clientCon->out_s, 100); /* Metadata message to xrdp (or if using helper, helper signal) */
++    out_uint16_le(clientCon->out_s, clientCon->count);
++    out_uint32_le(clientCon->out_s, len - layer_size);
++    rv = rdpClientConSend(dev, clientCon, clientCon->out_s->data, len);
++    return rv;
++}
++
+ /******************************************************************************/
+ static int
+ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+@@ -855,7 +1120,7 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+     int i1;
+     int index;
+     BoxRec box;
+-    enum shared_memory_status shmemstatus = SHM_ACTIVE;
++    enum shared_memory_status shmemstatus = SHM_ACTIVE_PENDING;
+ 
+     LLOGLN(0, ("rdpClientConProcessMsgClientInfo:"));
+     s = clientCon->in_s;
+@@ -887,8 +1152,8 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+     if (clientCon->client_info.capture_code == 2) /* RFX */
+     {
+         LLOGLN(0, ("rdpClientConProcessMsgClientInfo: got RFX capture"));
+-        clientCon->cap_width = RDPALIGN(clientCon->rdp_width, 64);
+-        clientCon->cap_height = RDPALIGN(clientCon->rdp_height, 64);
++        clientCon->cap_width = RDPALIGN(clientCon->rdp_width, XRDP_RFX_ALIGN);
++        clientCon->cap_height = RDPALIGN(clientCon->rdp_height, XRDP_RFX_ALIGN);
+         LLOGLN(0, ("  cap_width %d cap_height %d",
+                clientCon->cap_width, clientCon->cap_height));
+         bytes = clientCon->cap_width * clientCon->cap_height *
+@@ -896,20 +1161,24 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+         rdpClientConAllocateSharedMemory(clientCon, bytes);
+         clientCon->shmem_lineBytes = clientCon->rdp_Bpp * clientCon->cap_width;
+         clientCon->cap_stride_bytes = clientCon->cap_width * 4;
+-        shmemstatus = SHM_RFX_ACTIVE;
++        shmemstatus = SHM_RFX_ACTIVE_PENDING;
+     }
+     else if (clientCon->client_info.capture_code == 3) /* H264 */
+     {
+         LLOGLN(0, ("rdpClientConProcessMsgClientInfo: got H264 capture"));
+-        clientCon->cap_width = clientCon->rdp_width;
+-        clientCon->cap_height = clientCon->rdp_height;
++        clientCon->cap_width = RDPALIGN(clientCon->rdp_width, XRDP_H264_ALIGN);
++        clientCon->cap_height = RDPALIGN(clientCon->rdp_height, XRDP_H264_ALIGN);
+         LLOGLN(0, ("  cap_width %d cap_height %d",
+                clientCon->cap_width, clientCon->cap_height));
+         bytes = clientCon->cap_width * clientCon->cap_height * 2;
++        if (clientCon->client_info.capture_format == XRDP_yuv444_709fr)
++        {
++            bytes = clientCon->cap_width * clientCon->cap_height * 4;
++        }
+         rdpClientConAllocateSharedMemory(clientCon, bytes);
+         clientCon->shmem_lineBytes = clientCon->rdp_Bpp * clientCon->cap_width;
+         clientCon->cap_stride_bytes = clientCon->cap_width * 4;
+-        shmemstatus = SHM_H264_ACTIVE;
++        shmemstatus = SHM_H264_ACTIVE_PENDING;
+     }
+ 
+     if (clientCon->client_info.capture_format != 0)
+@@ -1004,7 +1273,6 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+         memcpy(dev->minfo, clientCon->client_info.display_sizes.minfo, sizeof(dev->minfo));
+         dev->monitorCount = clientCon->client_info.display_sizes.monitorCount;
+ #endif
+-
+         box.x1 = dev->minfo[0].left;
+         box.y1 = dev->minfo[0].top;
+         box.x2 = dev->minfo[0].right;
+@@ -1029,9 +1297,12 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+                    dev->minfo[index].right,
+                    dev->minfo[index].bottom));
+         }
+-
++#if defined(XORGXRDP_LRANDR)
++        rdpLRRSetRdpOutputs(dev);
++#else
+         rdpRRSetRdpOutputs(dev);
+         RRTellChanged(dev->pScreen);
++#endif
+     }
+     else
+     {
+@@ -1039,19 +1310,37 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
+         clientCon->doMultimon = 0;
+         dev->doMultimon = 0;
+         dev->monitorCount = 0;
++#if defined(XORGXRDP_LRANDR)
++        rdpLRRSetRdpOutputs(dev);
++#else
+         rdpRRSetRdpOutputs(dev);
+         RRTellChanged(dev->pScreen);
++#endif
+     }
+ 
+     /* rdpLoadLayout */
+     rdpInputKeyboardEvent(dev, 18, (long)(&(clientCon->client_info)),
+                           0, 0, 0);
+ 
+-    if (clientCon->shmemstatus == SHM_UNINITIALIZED || clientCon->shmemstatus == SHM_RESIZING) {
+-        clientCon->shmemstatus = shmemstatus;
++    /* currently only nvenc and h264 is supported */
++    if (rdpClientConUseHelper(dev, clientCon))
++    {
++        rdpStartHelper(dev, clientCon);
++        rdpSendHelperMonitors(dev, clientCon);
++    }
++    else
++    {
++        rdpSendMemoryAllocationComplete(dev, clientCon);
++        rdpClientConAddDirtyScreen(dev, clientCon, 0, 0, clientCon->rdp_width,
++                                   clientCon->rdp_height);
+     }
+ 
+-    rdpClientConAddDirtyScreen(dev, clientCon, 0, 0, clientCon->rdp_width, clientCon->rdp_height);
++    if (clientCon->shmemstatus == SHM_UNINITIALIZED
++       || clientCon->shmemstatus == SHM_RESIZING)
++    {
++        clientCon->shmemstatus = rdpClientConUseHelper(dev, clientCon) ? shmemstatus
++                            : convertSharedMemoryStatusToActive(shmemstatus);
++    }
+ 
+     return 0;
+ }
+@@ -2396,6 +2685,8 @@ rdpClientConSendPaintRectShmEx(rdpPtr dev, rdpClientCon *clientCon,
+     struct stream *s;
+     BoxRec box;
+ 
++    LLOGLN(10, ("rdpClientConSendPaintRectShmEx:"));
++
+     rdpClientConBeginUpdate(dev, clientCon);
+ 
+     num_rects_d = REGION_NUM_RECTS(dirtyReg);
+@@ -2442,8 +2733,8 @@ rdpClientConSendPaintRectShmEx(rdpPtr dev, rdpClientCon *clientCon,
+         out_uint16_le(s, cy);
+     }
+ 
+-    out_uint32_le(s, 0);
+-    clientCon->rect_id++;
++    out_uint32_le(s, id->flags);
++    ++clientCon->rect_id;
+     out_uint32_le(s, clientCon->rect_id);
+     out_uint32_le(s, id->shmem_id);
+     out_uint32_le(s, id->shmem_offset);
+@@ -2492,6 +2783,10 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, struct image_data *id)
+         if (rdpCapture(clientCon, cap_dirty, &rects, &num_rects, id))
+         {
+             LLOGLN(10, ("rdpCapRect: num_rects %d", num_rects));
++            if (clientCon->rect_id_ack == INT_MAX)
++            {
++                id->flags |= KEY_FRAME_REQUESTED;
++            }
+             rdpClientConSendPaintRectShmEx(clientCon->dev, clientCon, id,
+                                            cap_dirty, rects, num_rects);
+             free(rects);
+@@ -2528,7 +2823,6 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+     clientCon = (rdpClientCon *) arg;
+     clientCon->updateScheduled = FALSE;
+     clientCon->lastUpdateTime = now;
+-
+     if (clientCon->suppress_output)
+     {
+         LLOGLN(10, ("rdpDeferredUpdateCallback: suppress_output set"));
+@@ -2548,11 +2842,12 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+         LLOGLN(10, ("rdpDeferredUpdateCallback: reschedule rect_id %d "
+                "rect_id_ack %d",
+                clientCon->rect_id, clientCon->rect_id_ack));
+-        rdpScheduleDeferredUpdate(clientCon);
++        rdpScheduleDeferredUpdate(clientCon, FALSE);
+         return 0;
+     }
+     LLOGLN(10, ("rdpDeferredUpdateCallback: sending"));
+     clientCon->updateRetries = 0;
++    clientCon->lastUpdateTime = now;
+     rdpClientConGetScreenImageRect(clientCon->dev, clientCon, &id);
+     LLOGLN(10, ("rdpDeferredUpdateCallback: rdp_width %d rdp_height %d "
+            "rdp_Bpp %d screen width %d screen height %d",
+@@ -2570,7 +2865,7 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+                dirty_extents.x2, dirty_extents.y2));
+         de_width = dirty_extents.x2 - dirty_extents.x1;
+         de_height = dirty_extents.y2 - dirty_extents.y1;
+-        if ((de_width > 0) && (de_height > 0))
++        if (de_width > 0 && de_height > 0)
+         {
+             band_height = MAX_CAPTURE_PIXELS / de_width;
+             band_index = 0;
+@@ -2639,7 +2934,7 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+     }
+     if (rdpRegionNotEmpty(clientCon->dirtyRegion))
+     {
+-        rdpScheduleDeferredUpdate(clientCon);
++        rdpScheduleDeferredUpdate(clientCon, FALSE);
+     }
+     return 0;
+ }
+@@ -2647,21 +2942,23 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
+ 
+ /******************************************************************************/
+ #define MIN_MS_BETWEEN_FRAMES 40
+-#define MIN_MS_TO_WAIT_FOR_MORE_UPDATES 4
+-#define UPDATE_RETRY_TIMEOUT 200 // After this number of retries, give up and perform the capture anyway. This prevents an infinite loop.
++#define MS_TO_WAIT_FOR_RETRY_UPDATE 4
++#define MIN_MS_TO_WAIT_FOR_MORE_UPDATES 1
++//#define UPDATE_RETRY_TIMEOUT 200 // After this number of retries, give up and perform the capture anyway. This prevents an infinite loop.
++
+ static void
+-rdpScheduleDeferredUpdate(rdpClientCon *clientCon)
++rdpScheduleDeferredUpdate(rdpClientCon *clientCon, Bool can_call_now)
+ {
+     uint32_t curTime;
+     uint32_t msToWait;
+     uint32_t minNextUpdateTime;
+ 
+-    if (clientCon->updateRetries > UPDATE_RETRY_TIMEOUT) {
+-        LLOGLN(10, ("rdpScheduleDeferredUpdate: clientCon->updateRetries is %d"
+-                    " and has exceeded the timeout of %d retries."
+-                    " Overriding rect_id_ack to INT_MAX.", clientCon->updateRetries, UPDATE_RETRY_TIMEOUT));
+-        clientCon->rect_id_ack = INT_MAX;
+-    }
++    // if (clientCon->updateRetries > UPDATE_RETRY_TIMEOUT) {
++    //     LLOGLN(10, ("rdpScheduleDeferredUpdate: clientCon->updateRetries is %d"
++    //                 " and has exceeded the timeout of %d retries."
++    //                 " Overriding rect_id_ack to INT_MAX.", clientCon->updateRetries, UPDATE_RETRY_TIMEOUT));
++    //     clientCon->rect_id_ack = INT_MAX;
++    // }
+ 
+     curTime = (uint32_t) GetTimeInMillis();
+     /* use two separate delays in order to limit the update rate and wait a bit
+@@ -2671,17 +2968,27 @@ rdpScheduleDeferredUpdate(rdpClientCon *clientCon)
+     minNextUpdateTime = clientCon->lastUpdateTime + MIN_MS_BETWEEN_FRAMES;
+     /* the first check is to gracefully handle the infrequent case of
+        the time wrapping around */
+-    if(clientCon->lastUpdateTime < curTime &&
++    if (clientCon->lastUpdateTime < curTime &&
+         minNextUpdateTime > curTime + msToWait)
+     {
+         msToWait = minNextUpdateTime - curTime;
+     }
+-
++    if (msToWait < 1)
++    {
++        if (can_call_now)
++        {
++            LLOGLN(10, ("rdpScheduleDeferredUpdate: now"));
++            rdpDeferredUpdateCallback(clientCon->updateTimer, curTime,
++                                      clientCon);
++            return;
++        }
++        msToWait = 1;
++    }
++    clientCon->updateScheduled = TRUE;
+     clientCon->updateTimer = TimerSet(clientCon->updateTimer, 0,
+                                       (CARD32) msToWait,
+                                       rdpDeferredUpdateCallback,
+                                       clientCon);
+-    clientCon->updateScheduled = TRUE;
+     ++clientCon->updateRetries;
+ }
+ 
+@@ -2694,7 +3001,7 @@ rdpClientConAddDirtyScreenReg(rdpPtr dev, rdpClientCon *clientCon,
+     rdpRegionUnion(clientCon->dirtyRegion, clientCon->dirtyRegion, reg);
+     if (clientCon->updateScheduled == FALSE)
+     {
+-        rdpScheduleDeferredUpdate(clientCon);
++        rdpScheduleDeferredUpdate(clientCon, TRUE);
+     }
+     return 0;
+ }
+@@ -2737,6 +3044,7 @@ rdpClientConGetScreenImageRect(rdpPtr dev, rdpClientCon *clientCon,
+     id->bpp = clientCon->rdp_bpp;
+     id->Bpp = clientCon->rdp_Bpp;
+     id->lineBytes = dev->paddedWidthInBytes;
++    id->flags = 0;
+     id->pixels = dev->pfbMemory;
+     id->shmem_pixels = clientCon->shmemptr;
+     id->shmem_id = clientCon->shmemid;
+@@ -2744,6 +3052,136 @@ rdpClientConGetScreenImageRect(rdpPtr dev, rdpClientCon *clientCon,
+     id->shmem_lineBytes = clientCon->shmem_lineBytes;
+ }
+ 
++/******************************************************************************/
++void
++rdpClientConGetPixmapImageRect(rdpPtr dev, rdpClientCon *clientCon,
++                               PixmapPtr pPixmap, struct image_data *id)
++{
++    id->width = pPixmap->drawable.width;
++    id->height = pPixmap->drawable.height;
++    id->bpp = clientCon->rdp_bpp;
++    id->Bpp = clientCon->rdp_Bpp;
++    id->lineBytes = pPixmap->devKind;
++    id->flags = 0;
++    id->pixels = (uint8_t *)(pPixmap->devPrivate.ptr);
++    id->shmem_pixels = 0;
++    id->shmem_id = 0;
++    id->shmem_offset = 0;
++    id->shmem_lineBytes = 0;
++}
++
++/******************************************************************************/
++void
++rdpClientConSendArea(rdpPtr dev, rdpClientCon *clientCon,
++                     struct image_data *id, int x, int y, int w, int h)
++{
++    struct image_data lid;
++    BoxRec box;
++    int ly;
++    int size;
++    const uint8_t *src;
++    uint8_t *dst;
++    struct stream *s;
++
++    LLOGLN(10, ("rdpClientConSendArea: id %p x %d y %d w %d h %d", id, x, y, w, h));
++
++    if (id == NULL)
++    {
++        rdpClientConGetScreenImageRect(dev, clientCon, &lid);
++        id = &lid;
++    }
++
++    if (x >= id->width)
++    {
++        return;
++    }
++
++    if (y >= id->height)
++    {
++        return;
++    }
++
++    if (x < 0)
++    {
++        w += x;
++        x = 0;
++    }
++
++    if (y < 0)
++    {
++        h += y;
++        y = 0;
++    }
++
++    if (w <= 0)
++    {
++        return;
++    }
++
++    if (h <= 0)
++    {
++        return;
++    }
++
++    if (x + w > id->width)
++    {
++        w = id->width - x;
++    }
++
++    if (y + h > id->height)
++    {
++        h = id->height - y;
++    }
++
++    if (clientCon->connected && clientCon->begin)
++    {
++        if (id->shmem_pixels != 0)
++        {
++            LLOGLN(10, ("rdpClientConSendArea: using shmem"));
++            box.x1 = x;
++            box.y1 = y;
++            box.x2 = box.x1 + w;
++            box.y2 = box.y1 + h;
++            src = id->pixels;
++            src += y * id->lineBytes;
++            src += x * dev->Bpp;
++            dst = id->shmem_pixels + id->shmem_offset;
++            dst += y * id->shmem_lineBytes;
++            dst += x * clientCon->rdp_Bpp;
++            ly = y;
++            while (ly < y + h)
++            {
++                rdpClientConConvertPixels(dev, clientCon, src, dst, w);
++                src += id->lineBytes;
++                dst += id->shmem_lineBytes;
++                ly += 1;
++            }
++            size = 36;
++            rdpClientConPreCheck(dev, clientCon, size);
++            s = clientCon->out_s;
++            out_uint16_le(s, 60);
++            out_uint16_le(s, size);
++            clientCon->count++;
++            LLOGLN(10, ("rdpClientConSendArea: 2 x %d y %d w %d h %d", x, y, w, h));
++            out_uint16_le(s, x);
++            out_uint16_le(s, y);
++            out_uint16_le(s, w);
++            out_uint16_le(s, h);
++            out_uint32_le(s, 0);
++            ++clientCon->rect_id;
++            out_uint32_le(s, clientCon->rect_id);
++            out_uint32_le(s, id->shmem_id);
++            out_uint32_le(s, id->shmem_offset);
++            out_uint16_le(s, id->width);
++            out_uint16_le(s, id->height);
++            out_uint16_le(s, x);
++            out_uint16_le(s, y);
++            rdpRegionUnionRect(clientCon->shmRegion, &box);
++            return;
++        }
++    }
++}
++
+ /******************************************************************************/
+ int
+ rdpClientConAddAllReg(rdpPtr dev, RegionPtr reg, DrawablePtr pDrawable)
+diff --git a/module/rdpClientCon.h b/module/rdpClientCon.h
+index 604bd227..febe955a 100644
+--- a/module/rdpClientCon.h
++++ b/module/rdpClientCon.h
+@@ -52,6 +52,9 @@ struct rdpup_os_bitmap
+ enum shared_memory_status {
+     SHM_UNINITIALIZED = 0,
+     SHM_RESIZING,
++    SHM_ACTIVE_PENDING,
++    SHM_RFX_ACTIVE_PENDING,
++    SHM_H264_ACTIVE_PENDING,
+     SHM_ACTIVE,
+     SHM_RFX_ACTIVE,
+     SHM_H264_ACTIVE
+@@ -112,6 +115,8 @@ struct _rdpClientCon
+     int rect_id_ack;
+     enum shared_memory_status shmemstatus;
+ 
++    PixmapPtr helperPixmaps[16];
++
+     OsTimerPtr updateTimer;
+     CARD32 lastUpdateTime; /* millisecond timestamp */
+     int updateScheduled; /* boolean */
+@@ -120,11 +125,14 @@ struct _rdpClientCon
+     RegionPtr dirtyRegion;
+ 
+     int num_rfx_crcs_alloc;
+-    int *rfx_crcs;
++    uint64_t *rfx_crcs;
++    uint64_t *rfx_tile_row_hashes;
+ 
+     /* true = skip drawing */
+     int suppress_output;
+ 
++    int helper_pid;
++
+     struct _rdpClientCon *next;
+     struct _rdpClientCon *prev;
+ };
+diff --git a/module/rdpDraw.h b/module/rdpDraw.h
+index 73263800..0f5fad20 100644
+--- a/module/rdpDraw.h
++++ b/module/rdpDraw.h
+@@ -49,7 +49,8 @@ misc draw calls
+     ) || \
+     ( \
+         ((_drw)->type == DRAWABLE_PIXMAP) && \
+-        (((PixmapPtr)(_drw))->devPrivate.ptr == (_dev)->pfbMemory) \
++            (_drw)->pScreen->GetScreenPixmap((_drw)->pScreen) == \
++            (PixmapPtr)(_drw) \
+     ) \
+ )
+ 
+diff --git a/module/rdpEgl.c b/module/rdpEgl.c
+index cbafeadd..10b86138 100644
+--- a/module/rdpEgl.c
++++ b/module/rdpEgl.c
+@@ -573,7 +573,7 @@ rdpEglOut(rdpClientCon *clientCon, struct rdp_egl *egl, RegionPtr in_reg,
+         /* resize the crc list */
+         clientCon->num_rfx_crcs_alloc = num_crcs;
+         free(clientCon->rfx_crcs);
+-        clientCon->rfx_crcs = g_new0(int, num_crcs);
++        clientCon->rfx_crcs = g_new0(uint64_t, num_crcs);
+     }
+     tile_extents_stride = (tile_extents_rect->x2 - tile_extents_rect->x1) / 64;
+     out_rect_index = 0;
+diff --git a/module/rdpLRandR.c b/module/rdpLRandR.c
+new file mode 100644
+index 00000000..e9236400
+--- /dev/null
++++ b/module/rdpLRandR.c
+@@ -0,0 +1,1407 @@
++#if defined(HAVE_CONFIG_H)
++#include "config_ac.h"
++#endif
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* this should be before all X11 .h files */
++#include <xorg-server.h>
++#include <xorgVersion.h>
++
++/* all driver need this */
++#include <xf86.h>
++#include <xf86_OSproc.h>
++
++#include "rdp.h"
++#include "rdpDraw.h"
++#include "rdpMisc.h"
++#include "rdpReg.h"
++#include "rdpLRandR.h"
++
++#if defined(XORGXRDP_GLAMOR)
++#include <glamor.h>
++#endif
++
++/******************************************************************************/
++#define LOG_LEVEL 1
++#define LLOGLN(_level, _args) \
++    do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
++
++/* 
++            start   end
++crtc ids    1       16
++output ids  17      32
++mode ids    33      48
++*/
++
++#define LRANDR_NAME                     "RANDR"
++#define SERVER_LRANDR_MAJOR_VERSION     1
++#define SERVER_LRANDR_MINOR_VERSION     3
++#define LRRNumberEvents                 2
++#define LRRNumberErrors                 4
++#define LRRNumberRequests               32 /* 1.3 */
++#define LRRMaxCrtcs                     16
++#define LRRMaxOutputs                   16
++#define LRRMaxOutputNameLength          16
++#define LRRMaxModes                     16
++#define LRRMaxModesNameLength           16
++#define LRRCrtcStart                    1
++#define LRROutputStart                  17
++#define LRRModeStart                    33
++
++#define OUTPUT2CRTC(_output)    ((_output) - LRRMaxCrtcs)
++#define OUTPUT2MODE(_output)    ((_output) + LRRMaxOutputs)
++
++#define CRTC2OUTPUT(_crtc)      ((_crtc) + LRRMaxCrtcs)
++#define CRTC2MODE(_crtc)        ((_crtc) + LRRMaxCrtcs + LRRMaxOutputs)
++
++struct _interestedClientRec
++{
++    ClientPtr pClient;
++    XID window;
++    CARD32 mask;
++    struct xorg_list entry;
++};
++typedef struct _interestedClientRec interestedClientRec;
++
++struct _LRRCrtcRec
++{
++    RRCrtc id; /* XID */
++    int x;
++    int y;
++    int width;
++    int height;
++};
++typedef struct _LRRCrtcRec LRRCrtcRec;
++
++struct _LRROutputRec
++{
++    RROutput id; /* XID */
++    char name[LRRMaxOutputNameLength];
++};
++typedef struct _LRROutputRec LRROutputRec;
++
++static int g_numCrtcs = 0;
++static LRRCrtcRec g_crtcs[LRRMaxCrtcs];
++
++static int g_numOutputs = 0;
++static LRROutputRec g_outputs[LRRMaxOutputs];
++static RROutput g_primaryOutput = None; /* XID */
++
++static int g_numModes = 0;
++static xRRModeInfo g_modes[LRRMaxModes];
++static char g_modeNames[LRRMaxModes][LRRMaxModesNameLength];
++
++static CARD32 g_updateTime;
++
++static int (*g_procLRandrVector[LRRNumberRequests]) (ClientPtr);
++
++static struct xorg_list g_interestedClients;
++
++static int LRRErrorBase;
++static int LRREventBase;
++
++static int g_width;
++static int g_height;
++static int g_mmWidth;
++static int g_mmHeight;
++
++/******************************************************************************/
++static int
++remove_client(ClientPtr pClient)
++{
++    interestedClientRec *iterator;
++    interestedClientRec *next;
++
++    xorg_list_for_each_entry_safe(iterator, next, &g_interestedClients, entry)
++    {
++        if (iterator->pClient == pClient)
++        {
++            LLOGLN(0, ("remove_client:                      client %p found "
++                   "pClient, removing", pClient));
++            xorg_list_del(&(iterator->entry));
++            free(iterator);
++        }
++    }
++    return 0;
++}
++
++/******************************************************************************/
++static int
++LRRDeliverScreenEvent(interestedClientRec *ic, ScreenPtr pScreen)
++{
++    xRRScreenChangeNotifyEvent se;
++    WindowPtr pRoot;
++    WindowPtr pWin;
++
++    LLOGLN(10, ("LRRDeliverScreenEvent:              client %p", ic->pClient));
++    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
++                        DixGetAttrAccess) != Success)
++    {
++        return 1;
++    }
++    memset(&se, 0, sizeof(se));
++    pRoot = pScreen->root;
++    LLOGLN(10, ("LRRDeliverScreenEvent: root id 0x%8.8x win id 0x%8.8x "
++           "width %d height %d",
++           pRoot->drawable.id, ic->window,
++           pScreen->width, pScreen->height));
++    se.type = RRScreenChangeNotify + LRREventBase;
++    se.rotation = RR_Rotate_0;
++    se.timestamp = g_updateTime;
++    se.configTimestamp = g_updateTime;
++    se.root = pRoot->drawable.id;
++    se.window = ic->window;
++    //se.sizeID = RR10CurrentSizeID(pScreen);
++    se.widthInPixels = pScreen->width;
++    se.heightInPixels = pScreen->height;
++    se.widthInMillimeters = pScreen->mmWidth;
++    se.heightInMillimeters = pScreen->mmHeight;
++    WriteEventsToClient(ic->pClient, 1, (xEvent *) &se);
++    return 0;
++}
++
++/******************************************************************************/
++static int
++LRRDeliverCrtcEvent(interestedClientRec *ic, LRRCrtcRec *pCrtc)
++{
++    xRRCrtcChangeNotifyEvent ce;
++    WindowPtr pWin;
++
++    LLOGLN(10, ("LRRDeliverCrtcEvent:                client %p", ic->pClient));
++    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
++                        DixGetAttrAccess) != Success)
++    {
++        return 1;
++    }
++    LLOGLN(10, ("LRRDeliverCrtcEvent: x %d y %d width %d height %d",
++           pCrtc->x, pCrtc->y, pCrtc->width, pCrtc->height));
++    memset(&ce, 0, sizeof(ce));
++    ce.type = RRNotify + LRREventBase;
++    ce.subCode = RRNotify_CrtcChange;
++    ce.timestamp = g_updateTime;
++    ce.window = ic->window;
++    ce.crtc = pCrtc->id;
++    ce.mode = CRTC2MODE(ce.crtc);
++    ce.rotation = RR_Rotate_0;
++    ce.x = pCrtc->x;
++    ce.y = pCrtc->y;
++    ce.width = pCrtc->width;
++    ce.height = pCrtc->height;
++    WriteEventsToClient(ic->pClient, 1, (xEvent *) &ce);
++    return 0;
++}
++
++/******************************************************************************/
++static int
++LRRDeliverOutputEvent(interestedClientRec *ic, LRROutputRec *pOutput)
++{
++    xRROutputChangeNotifyEvent oe;
++    WindowPtr pWin;
++
++    LLOGLN(10, ("LRRDeliverOutputEvent:              client %p", ic->pClient));
++    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
++                        DixGetAttrAccess) != Success)
++    {
++        return 1;
++    }
++    memset(&oe, 0, sizeof(oe));
++    oe.type = RRNotify + LRREventBase;
++    oe.subCode = RRNotify_OutputChange;
++    oe.timestamp = g_updateTime;
++    oe.configTimestamp = g_updateTime;
++    oe.window = ic->window;
++    oe.output = pOutput->id;
++    oe.crtc = OUTPUT2CRTC(oe.output);
++    oe.mode = OUTPUT2MODE(oe.output);
++    oe.rotation = RR_Rotate_0;
++    oe.connection = RR_Connected;
++    WriteEventsToClient(ic->pClient, 1, (xEvent *) &oe);
++    return 0;
++}
++
++/******************************************************************************/
++/* 0 */
++/*  RRQueryVersion
++        client-major-version:    CARD32
++        client-minor-version:    CARD32
++        x
++        major-version:           CARD32
++        minor-version:           CARD32 */
++static int
++ProcLRRQueryVersion(ClientPtr client)
++{
++    xRRQueryVersionReply rep;
++    REQUEST(xRRQueryVersionReq);
++
++    REQUEST_SIZE_MATCH(xRRQueryVersionReq);
++    LLOGLN(10, ("ProcLRRQueryVersion:                client %p version %d %d",
++           client, stuff->majorVersion, stuff->minorVersion));
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    if (version_compare(stuff->majorVersion, stuff->minorVersion,
++                        SERVER_LRANDR_MAJOR_VERSION,
++                        SERVER_LRANDR_MINOR_VERSION) < 0)
++    {
++        rep.majorVersion = stuff->majorVersion;
++        rep.minorVersion = stuff->minorVersion;
++    }
++    else
++    {
++        rep.majorVersion = SERVER_LRANDR_MAJOR_VERSION;
++        rep.minorVersion = SERVER_LRANDR_MINOR_VERSION;
++    }
++    /* require 1.1 or greater randr client */
++    if (version_compare(rep.majorVersion, rep.minorVersion, 1, 1) < 0)
++    {
++        LLOGLN(0, ("ProcLRRQueryVersion: bad version"));
++        return BadValue;
++    }
++    /* don't allow swapping */
++    if (client->swapped)
++    {
++        LLOGLN(0, ("ProcLRRQueryVersion: no swap support"));
++        return BadValue;
++    }
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 4 */
++/*  RRSelectInput
++        window: WINDOW
++        enable: SETofRRSELECTMASK */
++static int
++ProcLRRSelectInput(ClientPtr client)
++{
++    int rc;
++    WindowPtr pWin;
++    interestedClientRec* ic;
++    REQUEST(xRRSelectInputReq);
++
++    LLOGLN(10, ("ProcLRRSelectInput:                 client %p enable 0x%8.8x", client,
++           stuff->enable));
++    REQUEST_SIZE_MATCH(xRRSelectInputReq);
++
++    rc = dixLookupWindow(&pWin, stuff->window, client, DixGetAttrAccess);
++    if (rc != Success)
++    {
++        return rc;
++    }
++
++    if (stuff->enable & (RRScreenChangeNotifyMask |
++                         RRCrtcChangeNotifyMask |
++                         RROutputChangeNotifyMask |
++                         RROutputPropertyNotifyMask))
++    {
++        ic = (interestedClientRec *) calloc(1, sizeof(interestedClientRec));
++        if (ic == NULL)
++        {
++            return BadAlloc;
++        }
++        remove_client(client);
++        ic->pClient = client;
++        ic->mask = stuff->enable;
++        ic->window = stuff->window;
++        LLOGLN(0, ("ProcLRRSelectInput:                 client %p adding "
++               "pClient to list", client));
++        xorg_list_add(&(ic->entry), &g_interestedClients);
++    }
++    else if (stuff->enable == 0)
++    {
++        /* delete the interest */
++        remove_client(client);
++    }
++    else
++    {
++        LLOGLN(0, ("ProcLRRSelectInput: bad enable 0x%8.8x", stuff->enable));
++        client->errorValue = stuff->enable;
++        return BadValue;
++    }
++    return Success;
++}
++
++/******************************************************************************/
++/* 5 */
++/*  RRGetScreenInfo
++        window: WINDOW
++        x
++        rotations: SETofROTATION
++        root: WINDOW
++        timestamp: TIMESTAMP
++        config-timestamp: TIMESTAMP
++        size-id: SIZEID
++        rotation: ROTATION
++        rate: CARD16
++        sizes: LISTofSCREENSIZE
++        refresh: LISTofREFRESH */
++static int
++ProcLRRGetScreenInfo(ClientPtr client)
++{
++    int rc;
++    WindowPtr pWin;
++    xRRGetScreenInfoReply rep;
++    unsigned long extraLen;
++    CARD8 *extra;
++    xScreenSizes *size;
++    CARD16 *rates;
++    REQUEST(xRRGetScreenInfoReq);
++
++    LLOGLN(10, ("ProcLRRGetScreenInfo:               client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetScreenInfoReq);
++    rc = dixLookupWindow(&pWin, stuff->window, client, DixGetAttrAccess);
++    if (rc != Success)
++    {
++        return rc;
++    }
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.setOfRotations = RR_Rotate_0;
++    rep.sequenceNumber = client->sequence;
++    rep.root = pWin->drawable.pScreen->root->drawable.id;
++    rep.timestamp = g_updateTime;
++    rep.configTimestamp = g_updateTime;
++    rep.rotation = RR_Rotate_0;
++    rep.nSizes = 1;
++    rep.nrateEnts = 1 + 1;
++    rep.sizeID = 0;
++    rep.rate = 50;
++    extraLen = rep.nSizes * sizeof(xScreenSizes);
++    extraLen += rep.nrateEnts * sizeof(CARD16);
++    extra = (CARD8 *) calloc(extraLen, 1);
++    if (extra == NULL)
++    {
++        return BadAlloc;
++    }
++    size = (xScreenSizes *) extra;
++    rates = (CARD16 *) (size + rep.nSizes);
++    size->widthInPixels = g_width;
++    size->heightInPixels = g_height;
++    size->widthInMillimeters = g_mmWidth;
++    size->heightInMillimeters = g_mmHeight;
++    size++;
++    *rates = 1; /* number of rates */
++    rates++;
++    *rates = 50;
++    rep.length = bytes_to_int32(extraLen);
++    WriteToClient(client, sizeof(rep), &rep);
++    if (extraLen != 0)
++    {
++        WriteToClient(client, extraLen, extra);
++        free(extra);
++    }
++    return Success;
++}
++
++/******************************************************************************/
++/* 6 */
++/*  RRGetScreenSizeRange
++        window: WINDOW
++        x
++        CARD16 minWidth, minHeight
++        CARD16 maxWidth, maxHeight */
++static int
++ProcLRRGetScreenSizeRange(ClientPtr client)
++{
++    xRRGetScreenSizeRangeReply rep;
++    REQUEST(xRRGetScreenSizeRangeReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetScreenSizeRange:          client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetScreenSizeRangeReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.minWidth = 64;
++    rep.minHeight = 64;
++    rep.maxWidth = 8192;
++    rep.maxHeight = 8192;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 8 */
++/*  RRGetScreenResources
++        window: WINDOW
++        x
++        timestamp: TIMESTAMP
++        config-timestamp: TIMESTAMP
++        crtcs: LISTofCRTC
++        outputs: LISTofOUTPUT
++        modes: LISTofMODEINFO */
++static int
++ProcLRRGetScreenResources(ClientPtr client)
++{
++    int index;
++    CARD8 *extra;
++    unsigned long extraLen;
++    RRCrtc *crtcs;
++    RROutput *outputs;
++    xRRModeInfo *modeinfos;
++    CARD8 *names;
++    xRRGetScreenResourcesReply rep;
++    REQUEST(xRRGetScreenResourcesReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetScreenResources:          client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetScreenResourcesReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.timestamp = g_updateTime;
++    rep.configTimestamp = g_updateTime;
++    rep.nCrtcs = g_numCrtcs;
++    rep.nOutputs = g_numOutputs;
++    rep.nModes = g_numModes;
++    for (index = 0; index < g_numModes; index++)
++    {
++        rep.nbytesNames += g_modes[index].nameLength;
++    }
++    LLOGLN(10, ("ProcLRRGetScreenResources: rep.nbytesNames %d",
++           rep.nbytesNames));
++    rep.length = (g_numCrtcs + g_numOutputs +
++                  g_numModes * bytes_to_int32(SIZEOF(xRRModeInfo)) +
++                  bytes_to_int32(rep.nbytesNames));
++    LLOGLN(10, ("ProcLRRGetScreenResources: rep.length %d", rep.length));
++    extraLen = rep.length << 2;
++    if (extraLen != 0)
++    {
++        extra = (CARD8 *) calloc(1, extraLen);
++        if (extra == NULL)
++        {
++            return BadAlloc;
++        }
++    }
++    else
++    {
++        extra = NULL;
++    }
++    LLOGLN(10, ("ProcLRRGetScreenResources: extraLen %d", (int) extraLen));
++    crtcs = (RRCrtc *) extra;
++    outputs = (RROutput *) (crtcs + g_numCrtcs);
++    modeinfos = (xRRModeInfo *) (outputs + g_numOutputs);
++    names = (CARD8 *) (modeinfos + g_numModes);
++    for (index = 0; index < g_numCrtcs; index++)
++    {
++        crtcs[index] = g_crtcs[index].id;
++    }
++    for (index = 0; index < g_numOutputs; index++)
++    {
++        outputs[index] = g_outputs[index].id;
++    }
++    for (index = 0; index < g_numModes; index++)
++    {
++        modeinfos[index] = g_modes[index];
++        memcpy(names, g_modeNames[index], g_modes[index].nameLength);
++        names += g_modes[index].nameLength;
++    }
++    WriteToClient(client, sizeof(rep), &rep);
++    if (extraLen != 0)
++    {
++        WriteToClient(client, extraLen, extra);
++        free(extra);
++    }
++    return Success;
++}
++
++#define OutputInfoExtra (SIZEOF(xRRGetOutputInfoReply) - 32)
++
++/******************************************************************************/
++/* 9 */
++/*  RRGetOutputInfo
++        output: OUTPUT
++        config-timestamp: TIMESTAMP
++        x
++        status: RRCONFIGSTATUS
++        timestamp: TIMESTAMP
++        crtc: CRTC
++        name: STRING
++        connection: CONNECTION
++        subpixel-order: SUBPIXELORDER
++        widthInMillimeters, heightInMillimeters: CARD32
++        crtcs: LISTofCRTC
++        clones: LISTofOUTPUT
++        modes: LISTofMODE
++        num-preferred: CARD16 */
++int
++ProcLRRGetOutputInfo(ClientPtr client)
++{
++    int index;
++    CARD8 *extra;
++    unsigned long extraLen;
++    LRROutputRec *output;
++    RRCrtc *crtcs;
++    RRMode *modes;
++    char *name;
++    xRRGetOutputInfoReply rep;
++    REQUEST(xRRGetOutputInfoReq);
++
++    LLOGLN(10, ("ProcLRRGetOutputInfo:               client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetOutputInfoReq);
++
++    if ((stuff->output < LRROutputStart) ||
++        (stuff->output >= LRROutputStart + LRRMaxOutputs))
++    {
++        return BadRequest;
++    }
++    output = g_outputs + (stuff->output - LRROutputStart);
++
++    memset(&rep, 0, sizeof(rep));
++    LLOGLN(10, ("ProcLRRGetOutputInfo: stuff->output %d", stuff->output));
++    rep.type = X_Reply;
++    rep.status = RRSetConfigSuccess;
++    rep.sequenceNumber = client->sequence;
++    rep.length = bytes_to_int32(OutputInfoExtra);
++    rep.timestamp = g_updateTime;
++    rep.crtc = OUTPUT2CRTC(stuff->output);
++    rep.mmWidth = 0;
++    rep.mmHeight = 0;
++    rep.connection = RR_Connected;
++    rep.subpixelOrder = SubPixelUnknown;
++    rep.nCrtcs = 1;
++    rep.nModes = 1;
++    rep.nPreferred = 1;
++    rep.nClones = 0;
++    rep.nameLength = strlen(output->name);
++    extraLen = (rep.nCrtcs + rep.nModes + bytes_to_int32(rep.nameLength)) << 2;
++    if (extraLen != 0)
++    {
++        rep.length += bytes_to_int32(extraLen);
++        extra = calloc(1, extraLen);
++        if (extra == NULL)
++        {
++            return BadAlloc;
++        }
++    }
++    else
++    {
++        extra = NULL;
++    }
++    crtcs = (RRCrtc *) extra;
++    modes = (RRMode *) (crtcs + rep.nCrtcs);
++    name = (char *) (modes + rep.nModes);
++    for (index = 0; index < rep.nCrtcs; index++)
++    {
++        crtcs[index] = OUTPUT2CRTC(stuff->output);
++    }
++    for (index = 0; index < rep.nModes; index++)
++    {
++        modes[index] = OUTPUT2MODE(stuff->output);
++    }
++    memcpy(name, output->name, rep.nameLength);
++    WriteToClient(client, sizeof(rep), &rep);
++    if (extraLen != 0)
++    {
++        WriteToClient(client, extraLen, extra);
++        free(extra);
++    }
++    return Success;
++
++}
++
++/******************************************************************************/
++/* 10 */
++/*  RRListOutputProperties
++        output:OUTPUT
++        x
++        atoms: LISTofATOM */
++static int
++ProcLRRListOutputProperties(ClientPtr client)
++{
++    xRRListOutputPropertiesReply rep;
++    REQUEST(xRRListOutputPropertiesReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRListOutputProperties:        client %p", client));
++    REQUEST_SIZE_MATCH(xRRListOutputPropertiesReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 11 */
++/*  RRQueryOutputProperty
++        output: OUTPUT
++        property: ATOM
++        x
++        pending: BOOL
++        range: BOOL
++        immutable: BOOL
++        valid-values: LISTofINT32 */
++static int
++ProcLRRQueryOutputProperty(ClientPtr client)
++{
++    xRRQueryOutputPropertyReply rep;
++
++    LLOGLN(10, ("ProcLRRQueryOutputProperty:         client %p", client));
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 15 */
++/*  RRGetOutputProperty
++        output: OUTPUT
++        property: ATOM
++        type: ATOM or AnyPropertyType
++        long-offset, long-length: CARD32
++        delete: BOOL
++        pending: BOOL
++        x
++        type: ATOM or None
++        format: {0, 8, 16, 32}
++        bytes-after: CARD32
++        value: LISTofINT8 or LISTofINT16 or LISTofINT32 */
++static int
++ProcLRRGetOutputProperty(ClientPtr client)
++{
++    xRRGetOutputPropertyReply rep;
++    REQUEST(xRRGetOutputPropertyReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetOutputProperty:           client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetOutputPropertyReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 20 */
++/*  RRGetCrtcInfo
++        crtc: CRTC
++        config-timestamp: TIMESTAMP
++        x
++        status: RRCONFIGSTATUS
++        timestamp: TIMESTAMP
++        x, y: INT16
++        width, height: CARD16
++        mode: MODE
++        rotation: ROTATION
++        outputs: LISTofOUTPUT
++        rotations: SETofROTATION
++        possible-outputs: LISTofOUTPUT */
++int
++ProcLRRGetCrtcInfo(ClientPtr client)
++{
++    RROutput output;
++    LRRCrtcRec *crtc;
++    xRRGetCrtcInfoReply rep;
++    REQUEST(xRRGetCrtcInfoReq);
++
++    LLOGLN(10, ("ProcLRRGetCrtcInfo:                 client %p crtc %d", client, stuff->crtc));
++    REQUEST_SIZE_MATCH(xRRGetCrtcInfoReq);
++
++    if ((stuff->crtc < LRRCrtcStart) ||
++        (stuff->crtc >= LRRCrtcStart + LRRMaxCrtcs))
++    {
++        return BadRequest;
++    }
++    crtc = g_crtcs + (stuff->crtc - LRRCrtcStart);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.status = RRSetConfigSuccess;
++    rep.sequenceNumber = client->sequence;
++    rep.timestamp = g_updateTime;
++    rep.x = crtc->x;
++    rep.y = crtc->y;
++    rep.width = crtc->width;
++    rep.height = crtc->height;
++    rep.mode = CRTC2MODE(stuff->crtc);
++    rep.nOutput = 1;
++    rep.nPossibleOutput = 1;
++    rep.length = rep.nOutput + rep.nPossibleOutput;
++    rep.rotation = RR_Rotate_0;
++    rep.rotations = RR_Rotate_0;
++    output = CRTC2OUTPUT(stuff->crtc);
++    WriteToClient(client, sizeof(rep), &rep);
++    WriteToClient(client, sizeof(output), &output);
++    WriteToClient(client, sizeof(output), &output);
++    return 0;
++}
++
++/******************************************************************************/
++/* 21 */
++/*  RRSetCrtcConfig
++        crtc: CRTC
++        timestamp: TIMESTAMP
++        config-timestamp: TIMESTAMP
++        x, y: INT16
++        mode: MODE
++        rotation: ROTATION
++        outputs: LISTofOUTPUT
++        x
++        status: RRCONFIGSTATUS
++        new-timestamp: TIMESTAMP */
++int
++ProcLRRSetCrtcConfig(ClientPtr client)
++{
++    xRRSetCrtcConfigReply rep;
++    REQUEST(xRRSetCrtcConfigReq);
++    TimeStamp ts;
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRSetCrtcConfig:               client %p", client));
++    REQUEST_SIZE_MATCH(xRRSetCrtcConfigReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.status = RRSetConfigSuccess;
++    rep.sequenceNumber = client->sequence;
++    ts = ClientTimeToServerTime(stuff->timestamp);
++    g_updateTime = ts.milliseconds;
++    rep.newTimestamp = g_updateTime;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 22 */
++/*  RRGetCrtcGammaSize
++        crtc: CRTC
++        x
++        size: CARD16 */
++int
++ProcLRRGetCrtcGammaSize(ClientPtr client)
++{
++    xRRGetCrtcGammaSizeReply rep;
++    REQUEST(xRRGetCrtcGammaSizeReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetCrtcGammaSize:            client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetCrtcGammaSizeReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.size = 256;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 23 */
++/*  RRGetCrtcGamma
++        crtc: CRTC
++        x
++        red: LISTofCARD16
++        green: LISTofCARD16
++        blue: LISTofCARD16 */
++int
++ProcLRRGetCrtcGamma(ClientPtr client)
++{
++    xRRGetCrtcGammaReply rep;
++    unsigned long len;
++    unsigned short *vals;
++    unsigned short val;
++    char *extra;
++    int index;
++    REQUEST(xRRGetCrtcGammaReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetCrtcGamma:                client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetCrtcGammaReq);
++    len = 256 * 3 * 2;
++    extra = (char *) malloc(len);
++    if (extra == NULL)
++    {
++        return BadAlloc;
++    }
++    vals = (unsigned short *) extra;
++    /* red */
++    for (index = 0; index < 256; index++)
++    {
++        val = (0xffff * index) / 255;
++        vals[0] = val;
++        vals += 1;
++    }
++    /* green */
++    for (index = 0; index < 256; index++)
++    {
++        val = (0xffff * index) / 255;
++        vals[0] = val;
++        vals += 1;
++    }
++    /* blue */
++    for (index = 0; index < 256; index++)
++    {
++        val = (0xffff * index) / 255;
++        vals[0] = val;
++        vals += 1;
++    }
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.length = bytes_to_int32(len);
++    rep.size = 256;
++    WriteToClient(client, sizeof(rep), &rep);
++    WriteToClient(client, len, extra);
++    return Success;
++}
++
++/******************************************************************************/
++/* 25 */
++/*  RRGetScreenResourcesCurrent
++        window: WINDOW
++        x
++        timestamp: TIMESTAMP
++        config-timestamp: TIMESTAMP
++        crtcs: LISTofCRTC
++        outputs: LISTofOUTPUT
++        modes: LISTofMODEINFO */
++int
++ProcLRRGetScreenResourcesCurrent(ClientPtr client)
++{
++    LLOGLN(10, ("ProcLRRGetScreenResourcesCurrent:   client %p", client));
++    return ProcLRRGetScreenResources(client);
++}
++
++#define CrtcTransformExtra  (SIZEOF(xRRGetCrtcTransformReply) - 32)
++#define ToFixed(f) ((int) ((f) * 65536))
++
++/******************************************************************************/
++/* 27 */
++/*  RRGetCrtcTransform
++        crtc: CRTC
++        x
++        pending-transform: TRANSFORM
++        pending-filter: STRING8
++        pending-values: LISTofFIXED
++        current-transform: TRANSFORM
++        current-filter: STRING8
++        current-values: LISTofFIXED */
++int
++ProcLRRGetCrtcTransform(ClientPtr client)
++{
++    xRRGetCrtcTransformReply rep;
++    REQUEST(xRRGetCrtcTransformReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetCrtcTransform:            client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetPanningReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.currentTransform.matrix11 = ToFixed(1);
++    rep.currentTransform.matrix22 = ToFixed(1);
++    rep.currentTransform.matrix33 = ToFixed(1);
++    rep.length = bytes_to_int32(CrtcTransformExtra);
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 28 */
++/*  RRGetPanning
++        crtc: CRTC
++        x
++        status: RRCONFIGSTATUS
++        timestamp: TIMESTAMP
++        left, top, width, height: CARD16
++        track_left, track_top, track_width, track_height: CARD16
++        border_left, border_top, border_right, border_bottom: INT16 */
++int
++ProcLRRGetPanning(ClientPtr client)
++{
++    xRRGetPanningReply rep;
++    REQUEST(xRRGetPanningReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetPanning:                  client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetPanningReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.status = RRSetConfigSuccess;
++    rep.sequenceNumber = client->sequence;
++    rep.length = 1,
++    rep.timestamp = g_updateTime;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++/* 31 */
++/*  RRGetOutputPrimary
++        window: WINDOW
++        x
++        output: OUTPUT */
++int
++ProcLRRGetOutputPrimary(ClientPtr client)
++{
++    xRRGetOutputPrimaryReply rep;
++    REQUEST(xRRGetOutputPrimaryReq);
++
++    (void) stuff;
++
++    LLOGLN(10, ("ProcLRRGetOutputPrimary:            client %p", client));
++    REQUEST_SIZE_MATCH(xRRGetOutputPrimaryReq);
++    memset(&rep, 0, sizeof(rep));
++    rep.type = X_Reply;
++    rep.sequenceNumber = client->sequence;
++    rep.output = g_primaryOutput;
++    WriteToClient(client, sizeof(rep), &rep);
++    return Success;
++}
++
++/******************************************************************************/
++static int
++ProcLRRDispatch(ClientPtr client)
++{
++    REQUEST(xReq);
++
++    LLOGLN(10, ("ProcLRRDispatch: data %d", stuff->data));
++    if (stuff->data >= LRRNumberRequests)
++    {
++        LLOGLN(0, ("ProcLRRDispatch: returning BadRequest, data %d",
++               stuff->data));
++        return BadRequest;
++    }
++    if (g_procLRandrVector[stuff->data] == NULL)
++    {
++        LLOGLN(0, ("ProcLRRDispatch: returning Success, data %d",
++               stuff->data));
++        return Success;
++    }
++    return g_procLRandrVector[stuff->data](client);
++}
++
++/******************************************************************************/
++static int
++SProcLRRDispatch(ClientPtr client)
++{
++    LLOGLN(0, ("SProcLRRDispatch:"));
++    return 0;
++}
++
++/******************************************************************************/
++static void
++LRRClientCallback(CallbackListPtr *list, void *closure, void *data)
++{
++    NewClientInfoRec *clientinfo;
++    ClientPtr pClient;
++
++    LLOGLN(10, ("LRRClientCallback: list %p closure %p data %p",
++           list, closure, data));
++    if (data != NULL)
++    {
++        clientinfo = (NewClientInfoRec *) data;
++        if (clientinfo->client != NULL)
++        {
++            pClient = clientinfo->client;
++            LLOGLN(10, ("LRRClientCallback: clientState %d clientGone %d",
++                   pClient->clientState, pClient->clientGone));
++            if (pClient->clientGone ||
++                (pClient->clientState == ClientStateRetained) ||
++                (pClient->clientState == ClientStateGone))
++            {
++                LLOGLN(10, ("LRRClientCallback: client gone"));
++                remove_client(pClient);
++            }
++        }
++    }
++}
++
++/******************************************************************************/
++int
++rdpLRRInit(rdpPtr dev)
++{
++    ExtensionEntry *extEntry;
++    int index;
++
++    LLOGLN(10, ("rdpLRRInit:"));
++    if (!AddCallback(&ClientStateCallback, LRRClientCallback, 0))
++    {
++        LLOGLN(0, ("rdpLRRInit: AddCallback failed"));
++        return 1;
++    }
++    LLOGLN(0, ("rdpLRRInit: AddCallback ok"));
++
++    extEntry = AddExtension(LRANDR_NAME,
++                            LRRNumberEvents, LRRNumberErrors,
++                            ProcLRRDispatch, SProcLRRDispatch,
++                            NULL, StandardMinorOpcode);
++    if (extEntry == NULL)
++    {
++        LLOGLN(0, ("rdpLRRInit: AddExtension failed"));
++        return 1;
++    }
++    LLOGLN(0, ("rdpLRRInit: AddExtension ok"));
++
++    LRRErrorBase = extEntry->errorBase;
++    LRREventBase = extEntry->eventBase;
++
++    for (index = 0; index < LRRMaxCrtcs; index++)
++    {
++        g_crtcs[index].id = index + LRRCrtcStart;
++    }
++
++    for (index = 0; index < LRRMaxOutputs; index++)
++    {
++        g_outputs[index].id = index + LRROutputStart;
++        snprintf(g_outputs[index].name, LRRMaxOutputNameLength,
++                 "rdp%d", index);
++    }
++
++    for (index = 0; index < LRRMaxModes; index++)
++    {
++        g_modes[index].id = index + LRRModeStart;
++    }
++
++    xorg_list_init(&g_interestedClients);
++
++    memset(g_procLRandrVector, 0, sizeof(g_procLRandrVector));
++    g_procLRandrVector[0] = ProcLRRQueryVersion;
++    //g_procLRandrVector[2] = ProcLRRSetScreenConfig; TODO
++    g_procLRandrVector[4] = ProcLRRSelectInput;
++    g_procLRandrVector[5] = ProcLRRGetScreenInfo;
++    /* V1.2 additions */
++    g_procLRandrVector[6] = ProcLRRGetScreenSizeRange;
++    //g_procLRandrVector[7] = ProcLRRSetScreenSize; ok
++    g_procLRandrVector[8] = ProcLRRGetScreenResources;
++    g_procLRandrVector[9] = ProcLRRGetOutputInfo;
++    g_procLRandrVector[10] = ProcLRRListOutputProperties;
++    g_procLRandrVector[11] = ProcLRRQueryOutputProperty;
++    //g_procLRandrVector[12] = ProcLRRConfigureOutputProperty; ok
++    //g_procLRandrVector[13] = ProcLRRChangeOutputProperty; ok
++    //g_procLRandrVector[14] = ProcLRRDeleteOutputProperty; ok
++    g_procLRandrVector[15] = ProcLRRGetOutputProperty;
++    //g_procLRandrVector[16] = ProcLRRCreateMode; ok
++    //g_procLRandrVector[17] = ProcLRRDestroyMode; ok
++    //g_procLRandrVector[18] = ProcLRRAddOutputMode; ok
++    //g_procLRandrVector[19] = ProcLRRDeleteOutputMode; ok
++    g_procLRandrVector[20] = ProcLRRGetCrtcInfo;
++    g_procLRandrVector[21] = ProcLRRSetCrtcConfig;
++    g_procLRandrVector[22] = ProcLRRGetCrtcGammaSize;
++    g_procLRandrVector[23] = ProcLRRGetCrtcGamma;
++    //g_procLRandrVector[24] = ProcLRRSetCrtcGamma; ok
++    /* V1.3 additions */
++    g_procLRandrVector[25] = ProcLRRGetScreenResourcesCurrent;
++    //g_procLRandrVector[26] = ProcLRRSetCrtcTransform; ok
++    g_procLRandrVector[27] = ProcLRRGetCrtcTransform;
++    g_procLRandrVector[28] = ProcLRRGetPanning;
++    //g_procLRandrVector[29] = ProcLRRSetPanning; TODO
++    //g_procLRandrVector[30] = ProcLRRSetOutputPrimary; ok
++    g_procLRandrVector[31] = ProcLRRGetOutputPrimary;
++
++    rdpLRRSetRdpOutputs(dev);
++    return 0;
++}
++
++#if defined(XORGXRDP_GLAMOR)
++/*****************************************************************************/
++static int
++rdpLRRSetPixmapVisitWindow(WindowPtr window, void *data)
++{
++    ScreenPtr screen;
++
++    LLOGLN(10, ("rdpLRRSetPixmapVisitWindow:"));
++    screen = window->drawable.pScreen;
++    if (screen->GetWindowPixmap(window) == data)
++    {
++        screen->SetWindowPixmap(window, screen->GetScreenPixmap(screen));
++        return WT_WALKCHILDREN;
++    }
++    return WT_DONTWALKCHILDREN;
++}
++#endif
++
++/*
++ * Edit connection information block so that new clients
++ * see the current screen size on connect
++ */
++/* from rrscreen.c */
++static void
++LRREditConnectionInfo(ScreenPtr pScreen)
++{
++    xConnSetup *connSetup;
++    char *vendor;
++    xPixmapFormat *formats;
++    xWindowRoot *root;
++    xDepth *depth;
++    xVisualType *visual;
++    int screen = 0;
++    int d;
++
++    if (ConnectionInfo == NULL)
++        return;
++
++    connSetup = (xConnSetup *) ConnectionInfo;
++    vendor = (char *) connSetup + sizeof(xConnSetup);
++    formats = (xPixmapFormat *) ((char *) vendor +
++                                 pad_to_int32(connSetup->nbytesVendor));
++    root = (xWindowRoot *) ((char *) formats +
++                            sizeof(xPixmapFormat) *
++                            screenInfo.numPixmapFormats);
++    while (screen != pScreen->myNum) {
++        depth = (xDepth *) ((char *) root + sizeof(xWindowRoot));
++        for (d = 0; d < root->nDepths; d++) {
++            visual = (xVisualType *) ((char *) depth + sizeof(xDepth));
++            depth = (xDepth *) ((char *) visual +
++                                depth->nVisuals * sizeof(xVisualType));
++        }
++        root = (xWindowRoot *) ((char *) depth);
++        screen++;
++    }
++    root->pixWidth = pScreen->width;
++    root->pixHeight = pScreen->height;
++    root->mmWidth = pScreen->mmWidth;
++    root->mmHeight = pScreen->mmHeight;
++}
++
++/******************************************************************************/
++static void
++LRRSendConfigNotify(ScreenPtr pScreen)
++{
++    WindowPtr pWin;
++    xEvent event;
++
++    pWin = pScreen->root;
++    memset(&event, 0, sizeof(event));
++    event.u.configureNotify.window = pWin->drawable.id;
++    event.u.configureNotify.width = pWin->drawable.width;
++    event.u.configureNotify.height = pWin->drawable.height;
++    event.u.configureNotify.borderWidth = wBorderWidth(pWin);
++    event.u.configureNotify.override = pWin->overrideRedirect;
++    event.u.u.type = ConfigureNotify;
++    DeliverEvents(pWin, &event, 1, NullWindow);
++}
++
++/******************************************************************************/
++Bool
++rdpLRRScreenSizeSet(rdpPtr dev, int width, int height,
++                    int mmWidth, int mmHeight)
++{
++    WindowPtr root;
++    PixmapPtr screenPixmap;
++    BoxRec box;
++    ScreenPtr pScreen;
++
++    LLOGLN(10, ("rdpLRRScreenSizeSet: width %d height %d mmWidth %d mmHeight %d",
++           width, height, mmWidth, mmHeight));
++    pScreen = dev->pScreen;
++    root = rdpGetRootWindowPtr(pScreen);
++    if ((width < 1) || (height < 1))
++    {
++        LLOGLN(10, ("  error width %d height %d", width, height));
++        return FALSE;
++    }
++    dev->width = width;
++    dev->height = height;
++    dev->paddedWidthInBytes = PixmapBytePad(dev->width, dev->depth);
++    dev->sizeInBytes = dev->paddedWidthInBytes * dev->height;
++    pScreen->width = width;
++    pScreen->height = height;
++    pScreen->mmWidth = mmWidth;
++    pScreen->mmHeight = mmHeight;
++
++    g_width = width;
++    g_height = height;
++    g_mmWidth = mmWidth;
++    g_mmHeight = mmHeight;
++
++    screenPixmap = dev->screenSwPixmap;
++    free(dev->pfbMemory_alloc);
++    dev->pfbMemory_alloc = g_new0(uint8_t, dev->sizeInBytes + 16);
++    dev->pfbMemory = (uint8_t *) RDPALIGN(dev->pfbMemory_alloc, 16);
++    pScreen->ModifyPixmapHeader(screenPixmap, width, height,
++                                -1, -1,
++                                dev->paddedWidthInBytes,
++                                dev->pfbMemory);
++    if (dev->glamor)
++    {
++#if defined(XORGXRDP_GLAMOR)
++        PixmapPtr old_screen_pixmap;
++        uint32_t screen_tex;
++        old_screen_pixmap = pScreen->GetScreenPixmap(pScreen);
++        screenPixmap = pScreen->CreatePixmap(pScreen,
++                                             pScreen->width,
++                                             pScreen->height,
++                                             pScreen->rootDepth,
++                                             GLAMOR_CREATE_NO_LARGE);
++        if (screenPixmap == NULL)
++        {
++            return FALSE;
++        }
++        screen_tex = glamor_get_pixmap_texture(screenPixmap);
++        LLOGLN(0, ("rdpLRRScreenSizeSet: screen_tex 0x%8.8x", screen_tex));
++        pScreen->SetScreenPixmap(screenPixmap);
++        if ((pScreen->root != NULL) && (pScreen->SetWindowPixmap != NULL))
++        {
++            TraverseTree(pScreen->root, rdpLRRSetPixmapVisitWindow, old_screen_pixmap);
++        }
++        pScreen->DestroyPixmap(old_screen_pixmap);
++#endif
++    }
++    box.x1 = 0;
++    box.y1 = 0;
++    box.x2 = width;
++    box.y2 = height;
++    rdpRegionInit(&root->winSize, &box, 1);
++    rdpRegionInit(&root->borderSize, &box, 1);
++    rdpRegionReset(&root->borderClip, &box);
++    rdpRegionBreak(&root->clipList);
++    root->drawable.width = width;
++    root->drawable.height = height;
++    ResizeChildrenWinSize(root, 0, 0, 0, 0);
++    LLOGLN(0, ("  screen resized to %dx%d", pScreen->width, pScreen->height));
++    LRREditConnectionInfo(pScreen);
++#if XORG_VERSION_CURRENT < XORG_VERSION_NUMERIC(1, 13, 0, 0, 0)
++    xf86EnableDisableFBAccess(pScreen->myNum, FALSE);
++    xf86EnableDisableFBAccess(pScreen->myNum, TRUE);
++#else
++    xf86EnableDisableFBAccess(xf86Screens[pScreen->myNum], FALSE);
++    xf86EnableDisableFBAccess(xf86Screens[pScreen->myNum], TRUE);
++#endif
++
++    return TRUE;
++}
++
++/******************************************************************************/
++Bool
++rdpLRRSetRdpOutputs(rdpPtr dev)
++{
++    interestedClientRec *iterator;
++    interestedClientRec *next;
++    char modeName[LRRMaxModesNameLength];
++    int width;
++    int height;
++    int index;
++    int count;
++    int cont;
++
++    LLOGLN(10, ("rdpLRRSetRdpOutputs: numCrtcs %d numOutputs %d "
++           "monitorCount %d",
++           g_numCrtcs, g_numOutputs, dev->monitorCount));
++    LRRSendConfigNotify(dev->pScreen);
++    g_primaryOutput = None;
++    width = dev->width;
++    height = dev->height;
++    LLOGLN(10, ("rdpLRRSetRdpOutputs: width %d height %d", width, height));
++    if (dev->monitorCount <= 0)
++    {
++        g_numCrtcs = 1;
++        g_crtcs[0].x = 0;
++        g_crtcs[0].y = 0;
++        g_crtcs[0].width = width;
++        g_crtcs[0].height = height;
++        g_numOutputs = 1;
++        g_numModes = 1;
++        g_modes[0].width = width;
++        g_modes[0].height = height;
++        g_modes[0].hTotal = width;
++        g_modes[0].vTotal = height;
++        g_modes[0].dotClock = 50 * width * height;
++        snprintf(modeName, LRRMaxModesNameLength, "%dx%d", width, height);
++        g_modes[0].nameLength = strlen(modeName);
++        memcpy(g_modeNames[0], modeName, g_modes[0].nameLength);
++    }
++    else
++    {
++        count = dev->monitorCount;
++        if (count > 16)
++        {
++            count = 16;
++        }
++        g_numCrtcs = count;
++        g_numOutputs = count;
++        g_numModes = count;
++        for (index = 0; index < count; index++)
++        {
++            g_crtcs[index].x = dev->minfo[index].left;
++            g_crtcs[index].y = dev->minfo[index].top;
++            width = dev->minfo[index].right - dev->minfo[index].left;
++            height = dev->minfo[index].bottom - dev->minfo[index].top;
++            g_crtcs[index].width = width;
++            g_crtcs[index].height = height;
++            g_modes[index].width = width;
++            g_modes[index].height = height;
++            g_modes[index].hTotal = width;
++            g_modes[index].vTotal = height;
++            g_modes[index].dotClock = 50 * width * height;
++            snprintf(modeName, LRRMaxModesNameLength, "%dx%d", width, height);
++            g_modes[index].nameLength = strlen(modeName);
++            memcpy(g_modeNames[index], modeName, g_modes[index].nameLength);
++            if (dev->minfo[index].is_primary)
++            {
++                g_primaryOutput = g_outputs[index].id;
++            }
++        }
++    }
++    g_updateTime = GetTimeInMillis();
++    xorg_list_for_each_entry_safe(iterator, next, &g_interestedClients, entry)
++    {
++        cont = 0;
++        LLOGLN(10, ("rdpLRRSetRdpOutputs:                client %p",
++               iterator->pClient));
++        if (iterator->mask & RRScreenChangeNotifyMask)
++        {
++            if (LRRDeliverScreenEvent(iterator, dev->pScreen) != 0)
++            {
++                LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
++                       "interested list"));
++                xorg_list_del(&(iterator->entry));
++                free(iterator);
++                continue;
++            }
++        }
++        if (iterator->mask & RRCrtcChangeNotifyMask)
++        {
++            for (index = 0; index < g_numCrtcs; index++)
++            {
++                if (LRRDeliverCrtcEvent(iterator, g_crtcs + index) != 0)
++                {
++                    LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
++                           "interested list"));
++                    xorg_list_del(&(iterator->entry));
++                    free(iterator);
++                    cont = 1;
++                    break;
++                }
++            }
++            if (cont)
++            {
++                continue;
++            }
++        }
++        if (iterator->mask & RROutputChangeNotifyMask)
++        {
++            for (index = 0; index < g_numOutputs; index++)
++            {
++                if (LRRDeliverOutputEvent(iterator, g_outputs + index) != 0)
++                {
++                    LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
++                           "interested list"));
++                    xorg_list_del(&(iterator->entry));
++                    free(iterator);
++                    cont = 1;
++                    break;
++                }
++            }
++            if (cont)
++            {
++                continue;
++            }
++        }
++    }
++    return TRUE;
++}
+diff --git a/module/rdpLRandR.h b/module/rdpLRandR.h
+new file mode 100644
+index 00000000..39595032
+--- /dev/null
++++ b/module/rdpLRandR.h
+@@ -0,0 +1,12 @@
++#ifndef _RDPLRANDR_H
++#define _RDPLRANDR_H
++
++int
++rdpLRRInit(rdpPtr dev);
++Bool
++rdpLRRScreenSizeSet(rdpPtr dev, int width, int height,
++                    int mmWidth, int mmHeight);
++Bool
++rdpLRRSetRdpOutputs(rdpPtr dev);
++
++#endif
+diff --git a/module/rdpMain.c b/module/rdpMain.c
+index 59b7e029..e6bfec79 100644
+--- a/module/rdpMain.c
++++ b/module/rdpMain.c
+@@ -41,12 +41,42 @@ rdp module main
+ #include <fb.h>
+ #include <micmap.h>
+ #include <mi.h>
++#include <mipointrst.h>
++
++#include <xf86xv.h>
++#include <xf86Crtc.h>
++
++#if XORG_VERSION_CURRENT < XORG_VERSION_NUMERIC(21, 1, 4, 0, 0)
++#define XACE_DISABLE_DRI3_PRESENT
++#endif
++
++#ifdef XACE_DISABLE_DRI3_PRESENT
++#include <xacestr.h>
++#include <xace.h>
++#endif
+ 
+ #include "rdp.h"
+ #include "rdpInput.h"
+ #include "rdpDraw.h"
+ #include "rdpClientCon.h"
+ #include "rdpMain.h"
++#include "rdpPri.h"
++#include "rdpPixmap.h"
++#include "rdpGC.h"
++#include "rdpMisc.h"
++#include "rdpComposite.h"
++#include "rdpGlyphs.h"
++#include "rdpTrapezoids.h"
++#include "rdpTriangles.h"
++#include "rdpCompositeRects.h"
++#include "rdpCursor.h"
++#include "rdpSimd.h"
++#include "rdpReg.h"
++#ifdef XORGXRDP_LRANDR
++#include "rdpLRandR.h"
++#else
++#include "rdpRandR.h"
++#endif
+ 
+ /******************************************************************************/
+ #define LOG_LEVEL 1
+@@ -55,6 +85,413 @@ rdp module main
+ 
+ static Bool g_initialised = FALSE;
+ 
++static Bool g_nvidia_wrap_done = FALSE;
++static DriverRec g_saved_driver;
++
++static OsTimerPtr g_timer = NULL;
++static xf86PreInitProc *g_orgPreInit;
++static xf86ScreenInitProc *g_orgScreenInit;
++
++extern DriverPtr *xf86DriverList;
++extern int xf86NumDrivers;
++
++/*****************************************************************************/
++static Bool
++xorgxrdpPreInit(ScrnInfoPtr pScrn, int flags)
++{
++    Bool rv;
++
++    LLOGLN(0, ("xorgxrdpPreInit:"));
++    rv = g_orgPreInit(pScrn, flags);
++    if (rv)
++    {
++        pScrn->reservedPtr[0] = xnfcalloc(sizeof(rdpRec), 1);
++#if defined(RANDR) && defined(XORGXRDP_LRANDR)
++        noRRExtension = TRUE; /* do not use build in randr */
++#endif
++    }
++    return rv;
++}
++
++/******************************************************************************/
++static miPointerSpriteFuncRec g_rdpSpritePointerFuncs =
++{
++    /* these are in rdpCursor.c */
++    rdpSpriteRealizeCursor,
++    rdpSpriteUnrealizeCursor,
++    rdpSpriteSetCursor,
++    rdpSpriteMoveCursor,
++    rdpSpriteDeviceCursorInitialize,
++    rdpSpriteDeviceCursorCleanup
++};
++
++/******************************************************************************/
++static void
++#if XORG_VERSION_CURRENT < XORG_VERSION_NUMERIC(1, 18, 5, 0, 0)
++rdpBlockHandler1(pointer blockData, OSTimePtr pTimeout, pointer pReadmask)
++#else
++rdpBlockHandler1(void *blockData, void *pTimeout)
++#endif
++{
++}
++
++/******************************************************************************/
++static void
++#if XORG_VERSION_CURRENT < XORG_VERSION_NUMERIC(1, 18, 5, 0, 0)
++rdpWakeupHandler1(pointer blockData, int result, pointer pReadmask)
++#else
++rdpWakeupHandler1(void *blockData, int result)
++#endif
++{
++    rdpClientConCheck((ScreenPtr)blockData);
++}
++
++/*****************************************************************************/
++static Bool
++rdpCreateScreenResources(ScreenPtr pScreen)
++{
++    Bool ret;
++    rdpPtr dev;
++
++    LLOGLN(0, ("rdpCreateScreenResources:"));
++    dev = rdpGetDevFromScreen(pScreen);
++    pScreen->CreateScreenResources = dev->CreateScreenResources;
++    ret = pScreen->CreateScreenResources(pScreen);
++    pScreen->CreateScreenResources = rdpCreateScreenResources;
++    if (!ret)
++    {
++        return FALSE;
++    }
++    dev->screenSwPixmap = pScreen->CreatePixmap(pScreen,
++                                                dev->width, dev->height,
++                                                dev->depth,
++                                                CREATE_PIXMAP_USAGE_SHARED);
++    dev->pfbMemory = dev->screenSwPixmap->devPrivate.ptr;
++    dev->paddedWidthInBytes = dev->screenSwPixmap->devKind;
++    dev->sizeInBytes = dev->paddedWidthInBytes * dev->height;
++    return TRUE;
++}
++
++/******************************************************************************/
++static Bool
++xorgxrdpRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height,
++                        CARD32 mmWidth, CARD32 mmHeight)
++{
++    Bool rv;
++    rdpPtr dev;
++    rrScrPrivPtr pRRScrPriv;
++
++    LLOGLN(0, ("xorgxrdpRRScreenSetSize: width %d height %d", width, height));
++    dev = rdpGetDevFromScreen(pScreen);
++
++    pRRScrPriv = rrGetScrPriv(pScreen);
++    pRRScrPriv->rrScreenSetSize = dev->rrScreenSetSize;
++    rv = pRRScrPriv->rrScreenSetSize(pScreen, width, height, mmWidth, mmHeight);
++    pRRScrPriv->rrScreenSetSize = xorgxrdpRRScreenSetSize;
++
++    dev->width = width;
++    dev->height = height;
++
++    pScreen->DestroyPixmap(dev->screenSwPixmap);
++    dev->screenSwPixmap = pScreen->CreatePixmap(pScreen,
++                                                dev->width, dev->height,
++                                                dev->depth,
++                                                CREATE_PIXMAP_USAGE_SHARED);
++    dev->pfbMemory = dev->screenSwPixmap->devPrivate.ptr;
++    dev->paddedWidthInBytes = dev->screenSwPixmap->devKind;
++    dev->sizeInBytes = dev->paddedWidthInBytes * dev->height;
++    return rv;
++}
++
++/*****************************************************************************/
++static void
++xorgxrdpDamageReport(DamagePtr pDamage, RegionPtr pRegion, void *closure)
++{
++    rdpPtr dev;
++    ScreenPtr pScreen;
++
++    LLOGLN(10, ("xorgxrdpDamageReport:"));
++    pScreen = (ScreenPtr)closure;
++    dev = rdpGetDevFromScreen(pScreen);
++    rdpClientConAddAllReg(dev, pRegion, &(pScreen->root->drawable));
++}
++
++/*****************************************************************************/
++static void
++xorgxrdpDamageDestroy(DamagePtr pDamage, void *closure)
++{
++    LLOGLN(0, ("xorgxrdpDamageDestroy:"));
++}
++
++#ifdef XACE_DISABLE_DRI3_PRESENT
++/*****************************************************************************/
++static void
++xorgxrdpExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
++{
++    XaceExtAccessRec *rec = calldata;
++    LLOGLN(10, ("xorgxrdpExtension:"));
++    LLOGLN(10, ("  name %s", rec->ext->name));
++    if (strcmp(rec->ext->name, "DRI3") == 0)
++    {
++        LLOGLN(10, ("  disabling name %s", rec->ext->name));
++        rec->status = BadValue;
++    }
++    if (strcmp(rec->ext->name, "Present") == 0)
++    {
++        LLOGLN(10, ("  disabling name %s", rec->ext->name));
++        rec->status = BadValue;
++    }
++}
++#endif
++
++/******************************************************************************/
++/* returns error */
++static CARD32
++xorgxrdpDeferredStartup(OsTimerPtr timer, CARD32 now, pointer arg)
++{
++    rdpPtr dev;
++    ScreenPtr pScreen;
++
++    LLOGLN(0, ("xorgxrdpDeferredStartup:"));
++    pScreen = (ScreenPtr)arg;
++    if (pScreen->root != NULL)
++    {
++        dev = rdpGetDevFromScreen(pScreen);
++#if defined(XORGXRDP_LRANDR)
++        rdpLRRInit(dev);
++#endif
++        dev->damage = DamageCreate(xorgxrdpDamageReport, xorgxrdpDamageDestroy,
++                                   DamageReportRawRegion, TRUE,
++                                   pScreen, pScreen);
++        if (dev->damage != NULL)
++        {
++            DamageSetReportAfterOp(dev->damage, TRUE);
++            DamageRegister(&(pScreen->root->drawable), dev->damage);
++            LLOGLN(0, ("xorgxrdpSetupDamage: DamageRegister ok"));
++            TimerFree(g_timer);
++            g_timer = NULL;
++#ifdef XACE_DISABLE_DRI3_PRESENT
++            if (getenv("XORGXRDP_NO_XACE_DISABLE_DRI3_PRESENT") == NULL)
++            {
++                XaceRegisterCallback(XACE_EXT_ACCESS, xorgxrdpExtension, NULL);
++            }
++#endif
++            return 0;
++        }
++    }
++    g_timer = TimerSet(g_timer, 0, 1, xorgxrdpDeferredStartup, pScreen);
++    return 0;
++}
++
++/*****************************************************************************/
++static Bool
++xorgxrdpScreenInit(ScreenPtr pScreen, int argc, char** argv)
++{
++    Bool rv;
++    rdpPtr dev;
++    ScrnInfoPtr pScrn;
++    PictureScreenPtr ps;
++    miPointerScreenPtr PointPriv;
++    rrScrPrivPtr pRRScrPriv;
++
++    LLOGLN(0, ("xorgxrdpScreenInit:"));
++    rv = g_orgScreenInit(pScreen, argc, argv);
++    if (rv)
++    {
++        pScrn = xf86Screens[pScreen->myNum];
++        dev = XRDPPTR(pScrn);
++        dev->nvidia = TRUE;
++        dev->pScreen = pScreen;
++        dev->depth = pScrn->depth;
++        dev->width = pScrn->virtualX;
++        dev->height = pScrn->virtualY;
++        dev->paddedWidthInBytes = PixmapBytePad(dev->width, dev->depth);
++        dev->bitsPerPixel = rdpBitsPerPixel(dev->depth);
++        dev->sizeInBytes = dev->paddedWidthInBytes * dev->height;
++
++        LLOGLN(0, ("xorgxrdpScreenInit: width %d height %d", dev->width, dev->height));
++
++        PointPriv = dixLookupPrivate(&pScreen->devPrivates, miPointerScreenKey);
++        PointPriv->spriteFuncs = &g_rdpSpritePointerFuncs;
++
++        dev->privateKeyRecGC = rdpAllocateGCPrivate(pScreen, sizeof(rdpGCRec));
++        dev->privateKeyRecPixmap = rdpAllocatePixmapPrivate(pScreen, sizeof(rdpPixmapRec));
++
++        dev->CloseScreen = pScreen->CloseScreen;
++        pScreen->CloseScreen = rdpCloseScreen;
++
++        dev->CopyWindow = pScreen->CopyWindow;
++        pScreen->CopyWindow = rdpCopyWindow;
++
++        dev->CreateGC = pScreen->CreateGC;
++        pScreen->CreateGC = rdpCreateGC;
++
++        dev->CreatePixmap = pScreen->CreatePixmap;
++        pScreen->CreatePixmap = rdpCreatePixmap;
++
++        dev->DestroyPixmap = pScreen->DestroyPixmap;
++        pScreen->DestroyPixmap = rdpDestroyPixmap;
++
++        dev->ModifyPixmapHeader = pScreen->ModifyPixmapHeader;
++        pScreen->ModifyPixmapHeader = rdpModifyPixmapHeader;
++
++        ps = GetPictureScreenIfSet(pScreen);
++        if (ps != 0)
++        {
++            /* composite */
++            dev->Composite = ps->Composite;
++            ps->Composite = rdpComposite;
++            /* glyphs */
++            dev->Glyphs = ps->Glyphs;
++            ps->Glyphs = rdpGlyphs;
++            /* trapezoids */
++            dev->Trapezoids = ps->Trapezoids;
++            ps->Trapezoids = rdpTrapezoids;
++            /* triangles */
++            dev->Triangles = ps->Triangles;
++            ps->Triangles = rdpTriangles;
++            /* composite rects */
++            dev->CompositeRects = ps->CompositeRects;
++            ps->CompositeRects = rdpCompositeRects;
++        }
++
++        dev->CreateScreenResources = pScreen->CreateScreenResources;
++        pScreen->CreateScreenResources = rdpCreateScreenResources;
++
++        RegisterBlockAndWakeupHandlers(rdpBlockHandler1, rdpWakeupHandler1, pScreen);
++
++        if (rdpClientConInit(dev) != 0)
++        {
++            LLOGLN(0, ("xorgxrdpScreenInit: rdpClientConInit failed"));
++        }
++
++        dev->Bpp_mask = 0x00FFFFFF;
++        dev->Bpp = 4;
++        dev->bitsPerPixel = 32;
++
++        rdpSimdInit(pScreen, pScrn);
++        pRRScrPriv = rrGetScrPriv(pScreen);
++        if (pRRScrPriv != NULL)
++        {
++            dev->rrSetConfig          = pRRScrPriv->rrSetConfig;
++            dev->rrGetInfo            = pRRScrPriv->rrGetInfo;
++            dev->rrScreenSetSize      = pRRScrPriv->rrScreenSetSize;
++            dev->rrCrtcSet            = pRRScrPriv->rrCrtcSet;
++            dev->rrCrtcSetGamma       = pRRScrPriv->rrCrtcSetGamma;
++            dev->rrCrtcGetGamma       = pRRScrPriv->rrCrtcGetGamma;
++            dev->rrOutputSetProperty  = pRRScrPriv->rrOutputSetProperty;
++            dev->rrOutputValidateMode = pRRScrPriv->rrOutputValidateMode;
++            dev->rrModeDestroy        = pRRScrPriv->rrModeDestroy;
++            dev->rrOutputGetProperty  = pRRScrPriv->rrOutputGetProperty;
++            dev->rrGetPanning         = pRRScrPriv->rrGetPanning;
++            dev->rrSetPanning         = pRRScrPriv->rrSetPanning;
++            pRRScrPriv->rrScreenSetSize = xorgxrdpRRScreenSetSize;
++        }
++        g_timer = TimerSet(g_timer, 0, 1, xorgxrdpDeferredStartup, pScreen);
++    }
++    return rv;
++}
++
++/*****************************************************************************/
++static Bool
++xorgxrdpWrapPreIntScreenInit(Bool ok)
++{
++    if (ok && (g_orgPreInit == NULL))
++    {
++        if ((xf86Screens != NULL) && (xf86Screens[0] != NULL))
++        {
++            if ((xf86Screens[0]->PreInit != NULL) &&
++                (xf86Screens[0]->ScreenInit != NULL))
++            {
++                g_orgPreInit = xf86Screens[0]->PreInit;
++                xf86Screens[0]->PreInit = xorgxrdpPreInit;
++                g_orgScreenInit = xf86Screens[0]->ScreenInit;
++                xf86Screens[0]->ScreenInit = xorgxrdpScreenInit;
++            }
++            else
++            {
++                LLOGLN(0, ("xorgxrdpWrapPreIntScreenInit: error"));
++            }
++        }
++        else
++        {
++            LLOGLN(0, ("xorgxrdpWrapPreIntScreenInit: error"));
++        }
++    }
++    return ok;
++}
++
++/*****************************************************************************/
++static Bool
++xorgxrdpPciProbe(struct _DriverRec * drv, int entity_num,
++                 struct pci_device * dev, intptr_t match_data)
++{
++    Bool rv;
++
++    LLOGLN(0, ("xorgxrdpPciProbe:"));
++    rv = g_saved_driver.PciProbe(drv, entity_num, dev, match_data);
++    return xorgxrdpWrapPreIntScreenInit(rv);
++}
++
++/*****************************************************************************/
++static Bool
++xorgxrdpPlatformProbe(struct _DriverRec * drv, int entity_num, int flags,
++                      struct xf86_platform_device * dev, intptr_t match_data)
++{
++    Bool rv;
++
++    LLOGLN(0, ("xorgxrdpPlatformProbe:"));
++    rv = g_saved_driver.platformProbe(drv, entity_num, flags, dev, match_data);
++    return xorgxrdpWrapPreIntScreenInit(rv);
++}
++
++/*****************************************************************************/
++static Bool
++xorgxrdpDriverFunc(ScrnInfoPtr pScrn, xorgDriverFuncOp op, pointer ptr)
++{
++    xorgHWFlags *flags;
++    Bool rv;
++
++    LLOGLN(0, ("xorgxrdpDriverFunc:"));
++    rv = g_saved_driver.driverFunc(pScrn, op, ptr);
++    if (op == GET_REQUIRED_HW_INTERFACES)
++    {
++        flags = (xorgHWFlags *) ptr;
++        *flags = HW_SKIP_CONSOLE;
++        rv = TRUE;
++    }
++    return rv;
++}
++
++/*****************************************************************************/
++int
++xorgxrdpCheckWrap(void)
++{
++    if (g_nvidia_wrap_done)
++    {
++        return 0;
++    }
++    if (xf86NumDrivers < 1)
++    {
++        return 0;
++    }
++    if ((xf86DriverList == NULL) || (xf86DriverList[0] == NULL) ||
++        (xf86DriverList[0]->driverName == NULL))
++    {
++        return 0;
++    }
++    if (strcmp(xf86DriverList[0]->driverName, "NVIDIA") == 0)
++    {
++        g_saved_driver = *(xf86DriverList[0]);
++        g_nvidia_wrap_done = TRUE;
++        LLOGLN(0, ("xorgxrdpCheckWrap: NVIDIA driver found"));
++        xf86DriverList[0]->PciProbe = xorgxrdpPciProbe;
++        xf86DriverList[0]->platformProbe = xorgxrdpPlatformProbe;
++        xf86DriverList[0]->driverFunc = xorgxrdpDriverFunc;
++    }
++    return 0;
++}
++
+ /*****************************************************************************/
+ static pointer
+ xorgxrdpSetup(pointer Module, pointer Options,
+diff --git a/module/rdpMain.h b/module/rdpMain.h
+index b3511980..2a92a25a 100644
+--- a/module/rdpMain.h
++++ b/module/rdpMain.h
+@@ -28,6 +28,8 @@ rdp module main
+ #include <xorgVersion.h>
+ #include <xf86.h>
+ 
++extern _X_EXPORT int
++xorgxrdpCheckWrap(void);
+ extern _X_EXPORT void
+ xorgxrdpDownDown(ScreenPtr pScreen);
+ 
+diff --git a/module/rdpPutImage.c b/module/rdpPutImage.c
+index d099a417..273ca5d6 100644
+--- a/module/rdpPutImage.c
++++ b/module/rdpPutImage.c
+@@ -68,9 +68,45 @@ rdpPutImage(DrawablePtr pDst, GCPtr pGC, int depth, int x, int y,
+     RegionRec reg;
+     int cd;
+     BoxRec box;
++    PixmapPtr pixmap;
++    int *pBits32;
++    rdpClientCon *clientCon;
++    ScreenPtr pScreen;
+ 
+     LLOGLN(10, ("rdpPutImage:"));
+-    dev = rdpGetDevFromScreen(pGC->pScreen);
++    pScreen = pGC->pScreen;
++    dev = rdpGetDevFromScreen(pScreen);
++    if ((x == 0) && (y == 0) && (w == 4) && (h == 4) && (depth >= 24) &&
++        (pDst->type == DRAWABLE_PIXMAP))
++    {
++        pBits32 = (int *) pBits;
++        if (pBits32[0] == 0xDEADBEEF)
++        {
++            clientCon = dev->clientConHead;
++            while (clientCon != NULL)
++            {
++                if (clientCon->conNumber == pBits32[1])
++                {
++                    /* free old */
++                    pixmap = clientCon->helperPixmaps[pBits32[2] & 0xF];
++                    if (pixmap != NULL)
++                    {
++                        pScreen->DestroyPixmap(pixmap);
++                    }
++                    /* set new */
++                    pixmap = (PixmapPtr) pDst;
++                    LLOGLN(0, ("rdpPutImage: setting conNumber %d, monitor num %d "
++                           "to pixmap %p", pBits32[1], pBits32[2], pixmap));
++                    clientCon->helperPixmaps[pBits32[2] & 0xF] = pixmap;
++                    /* so it can not get freed early */
++                    pixmap->refcnt++;
++                    break;
++                }
++                clientCon = clientCon->next;
++            }
++            return;
++        }
++    }
+     dev->counts.rdpPutImageCallCount++;
+     box.x1 = x + pDst->x;
+     box.y1 = y + pDst->y;
+diff --git a/module/rdpRandR.c b/module/rdpRandR.c
+index f96da0a0..775d5f8b 100644
+--- a/module/rdpRandR.c
++++ b/module/rdpRandR.c
+@@ -373,7 +373,7 @@ rdpRRAddOutput(rdpPtr dev, const char *aname, int x, int y, int width, int heigh
+     RROutputPtr output;
+     xRRModeInfo modeInfo;
+     char name[64];
+-    const int vfreq = 50;
++    const int vfreq = 25;
+     int i;
+ 
+     sprintf (name, "%dx%d", width, height);
+@@ -444,7 +444,7 @@ rdpRRUpdateOutput(RROutputPtr output, RRCrtcPtr crtc,
+     RRModePtr mode;
+     xRRModeInfo modeInfo;
+     char name[64];
+-    const int vfreq = 50;
++    const int vfreq = 25;
+ 
+     LLOGLN(0, ("rdpRRUpdateOutput:"));
+     sprintf (name, "%dx%d", width, height);
+@@ -530,6 +530,10 @@ rdpRRSetRdpOutputs(rdpPtr dev)
+     pRRScrPriv = rrGetScrPriv(dev->pScreen);
+     LLOGLN(0, ("rdpRRSetRdpOutputs: numCrtcs %d numOutputs %d monitorCount %d",
+            pRRScrPriv->numCrtcs, pRRScrPriv->numOutputs, dev->monitorCount));
++    if (dev->nvidia)
++    {
++        return 0;
++    }
+     if (dev->monitorCount <= 0)
+     {
+         left = 0;
+diff --git a/module/rdpSimd.c b/module/rdpSimd.c
+index 49a3653e..725402b5 100644
+--- a/module/rdpSimd.c
++++ b/module/rdpSimd.c
+@@ -62,6 +62,126 @@ int g_simd_use_accel = 1;
+ #define LLOGLN(_level, _args) \
+     do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
+ 
++#if SIMD_USE_ACCEL
++#if defined(__x86_64__) || defined(__AMD64__) || defined (_M_AMD64)
++/******************************************************************************/
++static int
++a8r8g8b8_to_nv12_box_amd64_sse2_wrap(const uint8_t *s8, int src_stride,
++                                     uint8_t *d8_y, int dst_stride_y,
++                                     uint8_t *d8_uv, int dst_stride_uv,
++                                     int width, int height)
++{
++    int awidth;
++    int lwidth;
++
++    awidth = width & ~7;
++    lwidth = width - awidth;
++    if (awidth > 0)
++    {
++        a8r8g8b8_to_nv12_box_amd64_sse2(s8, src_stride,
++                                        d8_y, dst_stride_y,
++                                        d8_uv, dst_stride_uv,
++                                        awidth, height);
++    }
++    if (lwidth > 0)
++    {
++        a8r8g8b8_to_nv12_box(s8 + awidth * 4, src_stride,
++                             d8_y + awidth, dst_stride_y,
++                             d8_uv + awidth, dst_stride_uv,
++                             lwidth, height);
++    }
++    return 0;
++}
++
++/******************************************************************************/
++static int
++a8r8g8b8_to_nv12_709fr_box_amd64_sse2_wrap(const uint8_t *s8, int src_stride,
++                                           uint8_t *d8_y, int dst_stride_y,
++                                           uint8_t *d8_uv, int dst_stride_uv,
++                                           int width, int height)
++{
++    int awidth;
++    int lwidth;
++
++    awidth = width & ~7;
++    lwidth = width - awidth;
++    if (awidth > 0)
++    {
++        a8r8g8b8_to_nv12_709fr_box_amd64_sse2(s8, src_stride,
++                                              d8_y, dst_stride_y,
++                                              d8_uv, dst_stride_uv,
++                                              awidth, height);
++    }
++    if (lwidth > 0)
++    {
++        a8r8g8b8_to_nv12_709fr_box(s8 + awidth * 4, src_stride,
++                                   d8_y + awidth, dst_stride_y,
++                                   d8_uv + awidth, dst_stride_uv,
++                                   lwidth, height);
++    }
++    return 0;
++}
++#elif defined(__x86__) || defined(_M_IX86) || defined(__i386__)
++/******************************************************************************/
++static int
++a8r8g8b8_to_nv12_box_x86_sse2_wrap(const uint8_t *s8, int src_stride,
++                                   uint8_t *d8_y, int dst_stride_y,
++                                   uint8_t *d8_uv, int dst_stride_uv,
++                                   int width, int height)
++{
++    int awidth;
++    int lwidth;
++
++    awidth = width & ~7;
++    lwidth = width - awidth;
++    if (awidth > 0)
++    {
++        a8r8g8b8_to_nv12_box_x86_sse2(s8, src_stride,
++                                      d8_y, dst_stride_y,
++                                      d8_uv, dst_stride_uv,
++                                      awidth, height);
++    }
++    if (lwidth > 0)
++    {
++        a8r8g8b8_to_nv12_box(s8 + awidth * 4, src_stride,
++                             d8_y + awidth, dst_stride_y,
++                             d8_uv + awidth, dst_stride_uv,
++                             lwidth, height);
++    }
++    return 0;
++}
++
++/******************************************************************************/
++static int
++a8r8g8b8_to_nv12_709fr_box_x86_sse2_wrap(const uint8_t *s8, int src_stride,
++                                         uint8_t *d8_y, int dst_stride_y,
++                                         uint8_t *d8_uv, int dst_stride_uv,
++                                         int width, int height)
++{
++    int awidth;
++    int lwidth;
++
++    awidth = width & ~7;
++    lwidth = width - awidth;
++    if (awidth > 0)
++    {
++        a8r8g8b8_to_nv12_709fr_box_x86_sse2(s8, src_stride,
++                                            d8_y, dst_stride_y,
++                                            d8_uv, dst_stride_uv,
++                                            awidth, height);
++    }
++    if (lwidth > 0)
++    {
++        a8r8g8b8_to_nv12_709fr_box(s8 + awidth * 4, src_stride,
++                                   d8_y + awidth, dst_stride_y,
++                                   d8_uv + awidth, dst_stride_uv,
++                                   lwidth, height);
++    }
++    return 0;
++}
++#endif
++#endif
++
+ /*****************************************************************************/
+ Bool
+ rdpSimdInit(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+@@ -77,6 +197,7 @@ rdpSimdInit(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+     dev->uyvy_to_rgb32 = UYVY_to_RGB32;
+     dev->a8r8g8b8_to_a8b8g8r8_box = a8r8g8b8_to_a8b8g8r8_box;
+     dev->a8r8g8b8_to_nv12_box = a8r8g8b8_to_nv12_box;
++    dev->a8r8g8b8_to_nv12_709fr_box = a8r8g8b8_to_nv12_709fr_box;
+ #if SIMD_USE_ACCEL
+     if (g_simd_use_accel)
+     {
+@@ -92,7 +213,8 @@ rdpSimdInit(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+             dev->yuy2_to_rgb32 = yuy2_to_rgb32_amd64_sse2;
+             dev->uyvy_to_rgb32 = uyvy_to_rgb32_amd64_sse2;
+             dev->a8r8g8b8_to_a8b8g8r8_box = a8r8g8b8_to_a8b8g8r8_box_amd64_sse2;
+-            dev->a8r8g8b8_to_nv12_box = a8r8g8b8_to_nv12_box_amd64_sse2;
++            dev->a8r8g8b8_to_nv12_box = a8r8g8b8_to_nv12_box_amd64_sse2_wrap;
++            dev->a8r8g8b8_to_nv12_709fr_box = a8r8g8b8_to_nv12_709fr_box_amd64_sse2_wrap;
+             LLOGLN(0, ("rdpSimdInit: sse2 amd64 yuv functions assigned"));
+         }
+ #elif defined(__x86__) || defined(_M_IX86) || defined(__i386__)
+@@ -107,7 +229,8 @@ rdpSimdInit(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+             dev->yuy2_to_rgb32 = yuy2_to_rgb32_x86_sse2;
+             dev->uyvy_to_rgb32 = uyvy_to_rgb32_x86_sse2;
+             dev->a8r8g8b8_to_a8b8g8r8_box = a8r8g8b8_to_a8b8g8r8_box_x86_sse2;
+-            dev->a8r8g8b8_to_nv12_box = a8r8g8b8_to_nv12_box_x86_sse2;
++            dev->a8r8g8b8_to_nv12_box = a8r8g8b8_to_nv12_box_x86_sse2_wrap;
++            dev->a8r8g8b8_to_nv12_709fr_box = a8r8g8b8_to_nv12_709fr_box_x86_sse2_wrap;
+             LLOGLN(0, ("rdpSimdInit: sse2 x86 yuv functions assigned"));
+         }
+ #endif
+@@ -115,4 +238,3 @@ rdpSimdInit(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+ #endif
+     return 1;
+ }
+-
+diff --git a/module/wyhash.h b/module/wyhash.h
+new file mode 100644
+index 00000000..5afc85f3
+--- /dev/null
++++ b/module/wyhash.h
+@@ -0,0 +1,113 @@
++/* Author: Wang Yi <godspeed_china@yeah.net>
++   chopped down and converted to older C standard for xorgxrdp
++*/
++#ifndef wyhash_final_version
++#define wyhash_final_version
++#ifndef WYHASH_CONDOM
++#define WYHASH_CONDOM 0
++#endif
++#include <stdint.h>
++#include <string.h>
++#if defined(_MSC_VER) && defined(_M_X64)
++  #include <intrin.h>
++  #pragma intrinsic(_umul128)
++#endif
++#if defined(__GNUC__) || defined(__INTEL_COMPILER) || defined(__clang__)
++  #define _likely_(x) __builtin_expect(x,1)
++  #define _unlikely_(x) __builtin_expect(x,0)
++#else
++  #define _likely_(x) (x)
++  #define _unlikely_(x) (x)
++#endif
++static __inline__ uint64_t _wyrot(uint64_t x) { return (x>>32)|(x<<32); }
++static __inline__ void _wymum(uint64_t *A, uint64_t *B){
++#if defined(__SIZEOF_INT128__)
++  __uint128_t r;
++  r=*A; r*=*B; 
++  #if(WYHASH_CONDOM>1)
++  *A^=(uint64_t)r; *B^=(uint64_t)(r>>64);
++  #else
++  *A=(uint64_t)r; *B=(uint64_t)(r>>64);
++  #endif
++#elif defined(_MSC_VER) && defined(_M_X64)
++  #if(WYHASH_CONDOM>1)
++  uint64_t  a,  b;
++  a=_umul128(*A,*B,&b);
++  *A^=a;  *B^=b;
++  #else
++  *A=_umul128(*A,*B,B);
++  #endif
++#else
++  uint64_t ha, hb, la, lb, hi, lo;
++  uint64_t rh, rm0, rm1, rl, t, c;
++  ha=*A>>32; hb=*B>>32; la=(uint32_t)*A; lb=(uint32_t)*B;
++  rh=ha*hb; rm0=ha*lb; rm1=hb*la; rl=la*lb; t=rl+(rm0<<32); c=t<rl;
++  lo=t+(rm1<<32); c+=lo<t; hi=rh+(rm0>>32)+(rm1>>32)+c;
++  #if(WYHASH_CONDOM>1)
++  *A^=lo;  *B^=hi;
++  #else
++  *A=lo;  *B=hi;
++  #endif
++#endif
++}
++static __inline__ uint64_t _wymix(uint64_t A, uint64_t B){ _wymum(&A,&B); return A^B; }
++#ifndef WYHASH_LITTLE_ENDIAN
++  #if defined(_WIN32) || defined(__LITTLE_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
++    #define WYHASH_LITTLE_ENDIAN 1
++  #elif defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++    #define WYHASH_LITTLE_ENDIAN 0
++  #endif
++#endif
++#if (WYHASH_LITTLE_ENDIAN)
++static __inline__ uint64_t _wyr8(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v;}
++static __inline__ uint64_t _wyr4(const uint8_t *p) { unsigned v; memcpy(&v, p, 4); return v;}
++#elif defined(__GNUC__) || defined(__INTEL_COMPILER) || defined(__clang__)
++static __inline__ uint64_t _wyr8(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return __builtin_bswap64(v);}
++static __inline__ uint64_t _wyr4(const uint8_t *p) { unsigned v; memcpy(&v, p, 4); return __builtin_bswap32(v);}
++#elif defined(_MSC_VER)
++static __inline__ uint64_t _wyr8(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return _byteswap_uint64(v);}
++static __inline__ uint64_t _wyr4(const uint8_t *p) { unsigned v; memcpy(&v, p, 4); return _byteswap_ulong(v);}
++#endif
++static __inline__ uint64_t _wyr3(const uint8_t *p, unsigned k) { return (((uint64_t)p[0])<<16)|(((uint64_t)p[k>>1])<<8)|p[k-1];}
++static __inline__ uint64_t _wyfinish16(const uint8_t *p, uint64_t len, uint64_t seed, const uint64_t *secret, uint64_t i){
++#if(WYHASH_CONDOM>0)
++  uint64_t a, b;
++  if(_likely_(i<=8)){
++    if(_likely_(i>=4)){ a=_wyr4(p); b=_wyr4(p+i-4); }
++    else if (_likely_(i)){ a=_wyr3(p,i); b=0; }
++    else a=b=0;
++  } 
++  else{ a=_wyr8(p); b=_wyr8(p+i-8); }
++  return _wymix(secret[1]^len,_wymix(a^secret[1], b^seed));
++#else
++  #define oneshot_shift ((i<8)*((8-i)<<3))
++  return _wymix(secret[1]^len,_wymix((_wyr8(p)<<oneshot_shift)^secret[1],(_wyr8(p+i-8)>>oneshot_shift)^seed));
++#endif
++}
++
++static __inline__ uint64_t _wyfinish(const uint8_t *p, uint64_t len, uint64_t seed, const uint64_t *secret, uint64_t i){
++  if(_likely_(i<=16)) return _wyfinish16(p,len,seed,secret,i);
++  return _wyfinish(p+16,len,_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^seed),secret,i-16);
++}
++
++static __inline__ uint64_t wyhash(const void *key, uint64_t len, uint64_t seed, const uint64_t *secret){
++  const uint8_t *p;
++  uint64_t i;
++  uint64_t see1;
++  p=(const uint8_t *)key;
++  i=len; seed^=*secret;
++  if(_unlikely_(i>64)){
++    see1=seed;
++    do{
++      seed=_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^seed)^_wymix(_wyr8(p+16)^secret[2],_wyr8(p+24)^seed);
++      see1=_wymix(_wyr8(p+32)^secret[3],_wyr8(p+40)^see1)^_wymix(_wyr8(p+48)^secret[4],_wyr8(p+56)^see1);
++      p+=64; i-=64;
++    }while(i>64);
++    seed^=see1;
++  }
++  return _wyfinish(p,len,seed,secret,i);
++}
++const uint64_t _wyp[5] = {0xa0761d6478bd642full, 0xe7037ed1a0b428dbull, 0x8ebc6af09c88c6e3ull, 0x589965cc75374cc3ull, 0x1d8e4e27c47d124full};
++static __inline__ uint64_t wyhash64(uint64_t A, uint64_t B){  A^=_wyp[0]; B^=_wyp[1];  _wymum(&A,&B);  return _wymix(A^_wyp[0],B^_wyp[1]);}
++static __inline__ uint64_t wyrand(uint64_t *seed){  *seed+=_wyp[0]; return _wymix(*seed,*seed^_wyp[1]);}
++#endif
+diff --git a/module/x86/Makefile.am b/module/x86/Makefile.am
+index ed106863..b004e8aa 100644
+--- a/module/x86/Makefile.am
++++ b/module/x86/Makefile.am
+@@ -3,6 +3,7 @@ NAFLAGS += -DASM_ARCH_I386
+ ASMSOURCES = \
+   a8r8g8b8_to_a8b8g8r8_box_x86_sse2.asm \
+   a8r8g8b8_to_nv12_box_x86_sse2.asm \
++  a8r8g8b8_to_nv12_709fr_box_x86_sse2.asm \
+   cpuid_x86.asm \
+   i420_to_rgb32_x86_sse2.asm \
+   uyvy_to_rgb32_x86_sse2.asm \
+diff --git a/module/x86/a8r8g8b8_to_nv12_709fr_box_x86_sse2.asm b/module/x86/a8r8g8b8_to_nv12_709fr_box_x86_sse2.asm
+new file mode 100644
+index 00000000..262f1af3
+--- /dev/null
++++ b/module/x86/a8r8g8b8_to_nv12_709fr_box_x86_sse2.asm
+@@ -0,0 +1,300 @@
++;
++;Copyright 2015 Jay Sorg
++;Copyright 2017 mirabilos
++;
++;Permission to use, copy, modify, distribute, and sell this software and its
++;documentation for any purpose is hereby granted without fee, provided that
++;the above copyright notice appear in all copies and that both that
++;copyright notice and this permission notice appear in supporting
++;documentation.
++;
++;The above copyright notice and this permission notice shall be included in
++;all copies or substantial portions of the Software.
++;
++;THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++;IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++;FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
++;OPEN GROUP BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
++;AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++;CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++;
++;ARGB to NV12 709 full range
++;x86 SSE2
++;
++; notes
++;   address s8 should be aligned on 16 bytes, will be slower if not
++;   width should be multiple of 8 and > 0
++;   height should be even and > 0
++
++%include "common.asm"
++
++PREPARE_RODATA
++    cd255  times 4 dd 255
++
++    cw255  times 8 dw 255
++    cw128  times 8 dw 128
++    cw54   times 8 dw 54
++    cw183  times 8 dw 183
++    cw18   times 8 dw 18
++    cw29   times 8 dw 29
++    cw99   times 8 dw 99
++    cw116  times 8 dw 116
++    cw12   times 8 dw 12
++    cw2    times 8 dw 2
++
++%define LU1            [esp +  0] ; first line U, 8 bytes
++%define LV1            [esp +  8] ; first line V, 8 bytes
++%define LU2            [esp + 16] ; second line U, 8 bytes
++%define LV2            [esp + 24] ; second line V, 8 bytes
++
++%define LS8            [esp + 52] ; s8
++%define LSRC_STRIDE    [esp + 56] ; src_stride
++%define LD8_Y          [esp + 60] ; d8_y
++%define LDST_Y_STRIDE  [esp + 64] ; dst_stride_y
++%define LD8_UV         [esp + 68] ; d8_uv
++%define LDST_UV_STRIDE [esp + 72] ; dst_stride_uv
++%define LWIDTH         [esp + 76] ; width
++%define LHEIGHT        [esp + 80] ; height
++
++;int
++;a8r8g8b8_to_nv12_709fr_box_x86_sse2(const char *s8, int src_stride,
++;                                    char *d8_y, int dst_stride_y,
++;                                    char *d8_uv, int dst_stride_uv,
++;                                    int width, int height);
++PROC a8r8g8b8_to_nv12_709fr_box_x86_sse2
++    push ebx
++    RETRIEVE_RODATA
++    push esi
++    push edi
++    push ebp
++    sub esp, 32                ; local vars, 32 bytes
++
++    pxor xmm7, xmm7
++
++    mov ebp, LHEIGHT           ; ebp = height
++    shr ebp, 1                 ; doing 2 lines at a time
++
++row_loop1:
++    mov esi, LS8               ; s8
++    mov edi, LD8_Y             ; d8_y
++    mov edx, LD8_UV            ; d8_uv
++
++    mov ecx, LWIDTH            ; ecx = width
++    shr ecx, 3                 ; doing 8 pixels at a time
++
++loop1:
++    ; first line
++    movdqu xmm0, [esi]         ; 4 pixels, 16 bytes
++    movdqa xmm1, xmm0          ; blue
++    pand xmm1, [lsym(cd255)]   ; blue
++    movdqa xmm2, xmm0          ; green
++    psrld xmm2, 8              ; green
++    pand xmm2, [lsym(cd255)]   ; green
++    movdqa xmm3, xmm0          ; red
++    psrld xmm3, 16             ; red
++    pand xmm3, [lsym(cd255)]   ; red
++
++    movdqu xmm0, [esi + 16]    ; 4 pixels, 16 bytes
++    movdqa xmm4, xmm0          ; blue
++    pand xmm4, [lsym(cd255)]   ; blue
++    movdqa xmm5, xmm0          ; green
++    psrld xmm5, 8              ; green
++    pand xmm5, [lsym(cd255)]   ; green
++    movdqa xmm6, xmm0          ; red
++    psrld xmm6, 16             ; red
++    pand xmm6, [lsym(cd255)]   ; red
++
++    packssdw xmm1, xmm4        ; xmm1 = 8 blues
++    packssdw xmm2, xmm5        ; xmm2 = 8 greens
++    packssdw xmm3, xmm6        ; xmm3 = 8 reds
++
++    ; _Y = (( 66 * _R + 129 * _G +  25 * _B) >> 8) +  16;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw18)]
++    pmullw xmm5, [lsym(cw183)]
++    pmullw xmm6, [lsym(cw54)]
++    paddw xmm4, xmm5
++    paddw xmm4, xmm6
++    psrlw xmm4, 8
++    packuswb xmm4, xmm7
++    movq [edi], xmm4           ; out 8 bytes yyyyyyyy
++
++    ; _U = ((-38 * _R -  74 * _G + 112 * _B) >> 8) + 128;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw99)]
++    pmullw xmm6, [lsym(cw29)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LU1, xmm4             ; save for later
++
++    ; _V = ((112 * _R -  94 * _G -  18 * _B) >> 8) + 128;
++    movdqa xmm6, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm4, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw116)]
++    pmullw xmm6, [lsym(cw12)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LV1, xmm4             ; save for later
++
++    ; go down to second line
++    add esi, LSRC_STRIDE
++    add edi, LDST_Y_STRIDE
++
++    ; second line
++    movdqu xmm0, [esi]         ; 4 pixels, 16 bytes
++    movdqa xmm1, xmm0          ; blue
++    pand xmm1, [lsym(cd255)]   ; blue
++    movdqa xmm2, xmm0          ; green
++    psrld xmm2, 8              ; green
++    pand xmm2, [lsym(cd255)]   ; green
++    movdqa xmm3, xmm0          ; red
++    psrld xmm3, 16             ; red
++    pand xmm3, [lsym(cd255)]   ; red
++
++    movdqu xmm0, [esi + 16]    ; 4 pixels, 16 bytes
++    movdqa xmm4, xmm0          ; blue
++    pand xmm4, [lsym(cd255)]   ; blue
++    movdqa xmm5, xmm0          ; green
++    psrld xmm5, 8              ; green
++    pand xmm5, [lsym(cd255)]   ; green
++    movdqa xmm6, xmm0          ; red
++    psrld xmm6, 16             ; red
++    pand xmm6, [lsym(cd255)]   ; red
++
++    packssdw xmm1, xmm4        ; xmm1 = 8 blues
++    packssdw xmm2, xmm5        ; xmm2 = 8 greens
++    packssdw xmm3, xmm6        ; xmm3 = 8 reds
++
++    ; _Y = (( 66 * _R + 129 * _G +  25 * _B) >> 8) +  16;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw18)]
++    pmullw xmm5, [lsym(cw183)]
++    pmullw xmm6, [lsym(cw54)]
++    paddw xmm4, xmm5
++    paddw xmm4, xmm6
++    psrlw xmm4, 8
++    packuswb xmm4, xmm7
++    movq [edi], xmm4           ; out 8 bytes yyyyyyyy
++
++    ; _U = ((-38 * _R -  74 * _G + 112 * _B) >> 8) + 128;
++    movdqa xmm4, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm6, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw99)]
++    pmullw xmm6, [lsym(cw29)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LU2, xmm4             ; save for later
++
++    ; _V = ((112 * _R -  94 * _G -  18 * _B) >> 8) + 128;
++    movdqa xmm6, xmm1          ; blue
++    movdqa xmm5, xmm2          ; green
++    movdqa xmm4, xmm3          ; red
++    pmullw xmm4, [lsym(cw128)]
++    pmullw xmm5, [lsym(cw116)]
++    pmullw xmm6, [lsym(cw12)]
++    psubw xmm4, xmm5
++    psubw xmm4, xmm6
++    psraw xmm4, 8
++    paddw xmm4, [lsym(cw128)]
++    packuswb xmm4, xmm7
++    movq LV2, xmm4             ; save for later
++
++    ; uv add and divide(average)
++    movq mm1, LU1              ; u from first line
++    movq mm3, mm1
++    pand mm1, [lsym(cw255)]
++    psrlw mm3, 8
++    pand mm3, [lsym(cw255)]
++    paddw mm1, mm3             ; add
++    movq mm2, LU2              ; u from second line
++    movq mm3, mm2
++    pand mm2, [lsym(cw255)]
++    paddw mm1, mm2             ; add
++    psrlw mm3, 8
++    pand mm3, [lsym(cw255)]
++    paddw mm1, mm3             ; add
++    paddw mm1, [lsym(cw2)]     ; add 2
++    psrlw mm1, 2               ; div 4
++
++    movq mm2, LV1              ; v from first line
++    movq mm4, mm2
++    pand mm2, [lsym(cw255)]
++    psrlw mm4, 8
++    pand mm4, [lsym(cw255)]
++    paddw mm2, mm4             ; add
++    movq mm3, LV2              ; v from second line
++    movq mm4, mm3
++    pand mm3, [lsym(cw255)]
++    paddw mm2, mm3             ; add
++    psrlw mm4, 8
++    pand mm4, [lsym(cw255)]
++    paddw mm2, mm4             ; add
++    paddw mm2, [lsym(cw2)]     ; add 2
++    psrlw mm2, 2               ; div 4
++
++    packuswb mm1, mm1
++    packuswb mm2, mm2
++
++    punpcklbw mm1, mm2         ; uv
++    movq [edx], mm1            ; out 8 bytes uvuvuvuv
++
++    ; go up to first line
++    sub esi, LSRC_STRIDE
++    sub edi, LDST_Y_STRIDE
++
++    ; move right
++    lea esi, [esi + 32]
++    lea edi, [edi + 8]
++    lea edx, [edx + 8]
++
++    dec ecx
++    jnz loop1
++
++    ; update s8
++    mov eax, LS8               ; s8
++    add eax, LSRC_STRIDE       ; s8 += src_stride
++    add eax, LSRC_STRIDE       ; s8 += src_stride
++    mov LS8, eax
++
++    ; update d8_y
++    mov eax, LD8_Y             ; d8_y
++    add eax, LDST_Y_STRIDE     ; d8_y += dst_stride_y
++    add eax, LDST_Y_STRIDE     ; d8_y += dst_stride_y
++    mov LD8_Y, eax
++
++    ; update d8_uv
++    mov eax, LD8_UV            ; d8_uv
++    add eax, LDST_UV_STRIDE    ; d8_uv += dst_stride_uv
++    mov LD8_UV, eax
++
++    dec ebp
++    jnz row_loop1
++
++    mov eax, 0                 ; return value
++    add esp, 32                ; local vars, 32 bytes
++    pop ebp
++    pop edi
++    pop esi
++    pop ebx
++    ret
++END_OF_FILE
+diff --git a/module/x86/funcs_x86.h b/module/x86/funcs_x86.h
+index c70cc8cf..a172cc32 100644
+--- a/module/x86/funcs_x86.h
++++ b/module/x86/funcs_x86.h
+@@ -43,6 +43,10 @@ a8r8g8b8_to_nv12_box_x86_sse2(const uint8_t *s8, int src_stride,
+                               uint8_t *d8_y, int dst_stride_y,
+                               uint8_t *d8_uv, int dst_stride_uv,
+                               int width, int height);
++int
++a8r8g8b8_to_nv12_709fr_box_x86_sse2(const uint8_t *s8, int src_stride,
++                                    uint8_t *d8_y, int dst_stride_y,
++                                    uint8_t *d8_uv, int dst_stride_uv,
++                                    int width, int height);
+ 
+ #endif
+-
+diff --git a/xrdpdev/Makefile.am b/xrdpdev/Makefile.am
+index 6787c663..14fb14f7 100644
+--- a/xrdpdev/Makefile.am
++++ b/xrdpdev/Makefile.am
+@@ -34,5 +34,5 @@ xrdpdev_drv_la_LIBADD =
+ xrdpdevsysconfdir=$(sysconfdir)/X11/xrdp
+ 
+ dist_xrdpdevsysconf_DATA = \
+-  xorg.conf
++  xorg.conf xorg_nvidia.conf
+ 
+diff --git a/xrdpdev/xorg_nvidia.conf b/xrdpdev/xorg_nvidia.conf
+new file mode 100644
+index 00000000..4e3ff5f5
+--- /dev/null
++++ b/xrdpdev/xorg_nvidia.conf
+@@ -0,0 +1,47 @@
++Section "ServerLayout"
++  Identifier "XRDP GPU Server"
++  Screen 0 "dGPU"
++  InputDevice "xrdpMouse" "CorePointer"
++  InputDevice "xrdpKeyboard" "CoreKeyboard"
++EndSection
++
++Section "ServerFlags"
++  # This line prevents "ServerLayout" sections in xorg.conf.d files
++  # overriding the "XRDP GPU Server" layout (xrdp #1784)
++  Option "DefaultServerLayout" "XRDP GPU Server"
++  Option "DontVTSwitch" "on"
++  Option "AutoAddDevices" "off"
++EndSection
++
++Section "Module"
++  Load "xorgxrdp"
++EndSection
++
++Section "InputDevice"
++  Identifier "xrdpKeyboard"
++  Driver "xrdpkeyb"
++EndSection
++
++Section "InputDevice"
++  Identifier "xrdpMouse"
++  Driver "xrdpmouse"
++EndSection
++
++Section "Screen"
++  Identifier "dGPU"
++  Device "dGPU"
++  Option "DPI" "96 x 96"
++# T4 needs an entry here, this is not the desktop size
++  SubSection "Display"
++    Virtual 1920 1080
++  EndSubSection
++EndSection
++
++Section "Device"
++  Identifier "dGPU"
++  Driver "nvidia"
++# T4 may need to comment out next line
++  Option "UseDisplayDevice" "none"
++  Option "ConnectToAcpid" "false"
++  BusID "PCI:101:0:0"
++EndSection
+diff --git a/xrdpdev/xrdpdev.c b/xrdpdev/xrdpdev.c
+index 72eb1aa0..ba193988 100644
+--- a/xrdpdev/xrdpdev.c
++++ b/xrdpdev/xrdpdev.c
+@@ -125,7 +125,7 @@ rdpAllocRec(ScrnInfoPtr pScrn)
+         return TRUE;
+     }
+     /* xnfcalloc exits if alloc failed */
+-    pScrn->driverPrivate = xnfcalloc(sizeof(rdpRec), 1);
++    pScrn->reservedPtr[0] = xnfcalloc(sizeof(rdpRec), 1);
+     return TRUE;
+ }
+ 
+@@ -491,8 +491,12 @@ rdpDeferredRandR(OsTimerPtr timer, CARD32 now, pointer arg)
+     }
+ 
+     RRScreenSetSizeRange(pScreen, 256, 256, 16 * 1024, 16 * 1024);
++#if defined(XORGXRDP_LRANDR)
++    rdpLRRSetRdpOutputs(dev);
++#else
+     rdpRRSetRdpOutputs(dev);
+     RRTellChanged(pScreen);
++#endif
+ 
+     return 0;
+ }
+diff --git a/xrdpkeyb/rdpKeyboard.c b/xrdpkeyb/rdpKeyboard.c
+index 4061b535..85add3e6 100644
+--- a/xrdpkeyb/rdpKeyboard.c
++++ b/xrdpkeyb/rdpKeyboard.c
+@@ -52,6 +52,7 @@ xrdp keyboard module
+ #include "rdpInput.h"
+ #include "rdpDraw.h"
+ #include "rdpMisc.h"
++#include "rdpMain.h"
+ 
+ /******************************************************************************/
+ #define LOG_LEVEL 1
+@@ -789,6 +790,7 @@ rdpkeybPlug(pointer module, pointer options, int *errmaj, int *errmin)
+ {
+     LLOGLN(0, ("rdpkeybPlug:"));
+     xf86AddInputDriver(&rdpkeyb, module, 0);
++    xorgxrdpCheckWrap();
+     return module;
+ }
+ 
